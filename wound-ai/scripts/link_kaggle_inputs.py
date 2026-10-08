@@ -37,6 +37,9 @@ def find(root: Path, ref: str) -> Path | None:
     return None
 
 
+NON_INTERACTIVE = False
+
+
 def download(ref: str) -> Path | None:
     """Downloads a public Kaggle dataset with kagglehub (no sign-in needed for public datasets on Kaggle)."""
     try:
@@ -44,8 +47,10 @@ def download(ref: str) -> Path | None:
 
         print(f"downloading {ref} ...", flush=True)
         return Path(kagglehub.dataset_download(ref))
-    except Exception as e:  # not installed, offline, renamed
-        print(f"  could not download {ref}: {e}")
+    except Exception as e:  # not installed, offline, renamed, or a background run
+        global NON_INTERACTIVE
+        NON_INTERACTIVE = NON_INTERACTIVE or "non-interactive" in str(e)
+        print(f"  could not download {ref}: {str(e)[:160]}")
         return None
 
 
@@ -70,6 +75,10 @@ def main():
         if not dst.exists():
             dst.symlink_to(src.resolve(), target_is_directory=True)
         print(f"linked {ref} -> {dst}")
+    if missing and NON_INTERACTIVE:
+        sys.exit("Kaggle only adds new datasets to a notebook in an interactive session. Open the notebook editor, "
+                 "turn the session on and run the cells up to this one once (this attaches the datasets for good), "
+                 "then Save Version -> Save & Run All again. Missing:\n  " + "\n  ".join(missing))
     if missing:
         sys.exit("Couldn't get (is Internet on in Session options?):\n  " + "\n  ".join(missing))
     print(f"all {len(DATASETS)} datasets linked")

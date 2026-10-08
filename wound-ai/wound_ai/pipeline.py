@@ -156,14 +156,16 @@ class WoundAnalyzer:
             return f
 
         crop = crop_to_wound(img, mask)
+        # Classifiers see the whole photo, as in training (the class manifests have no masks to crop with);
+        # on the outline crop the wound-type model fell from 83% to 50% on held-out photos.
         if "wound_type" in self.cls:
-            f["wound_type"] = self._classify(crop, "wound_type", intake)
+            f["wound_type"] = self._classify(img, "wound_type", intake)
         f["wound_type"] = apply_diabetic_foot_rule(f.get("wound_type"), intake)
         wt = (f.get("wound_type") or {}).get("label")
         f["severity"] = {}
         for head, applies_to in SEVERITY_HEADS.items():
             if head in self.cls and wt == applies_to:
-                f["severity"][head] = self._classify(crop, head, intake)
+                f["severity"][head] = self._classify(img, head, intake)
 
         if "tissue" in self.seg and mask is not None:
             tissue = self._segment(img, "tissue")

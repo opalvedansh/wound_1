@@ -128,7 +128,12 @@ def main():
     df["patient_id"] = df["patient_id"].astype(object)
     if no_pid.any():
         groups = group_near_duplicates(df.loc[no_pid, "image_path"].tolist())
-        df.loc[no_pid, "patient_id"] = [f"auto_{g}" for g in groups]
+        # Never reuse an ID already in the data (e.g. a merged older manifest also has auto_0, auto_1, ...).
+        taken, prefix, n = set(df.patient_id.dropna().astype(str)), "auto", 1
+        while any(f"{prefix}_{g}" in taken for g in set(groups)):
+            n += 1
+            prefix = f"auto{n}"
+        df.loc[no_pid, "patient_id"] = [f"{prefix}_{g}" for g in groups]
         n_groups = len(set(groups))
         print(f"{no_pid.sum()} images without patient_id -> {n_groups} near-duplicate groups")
 

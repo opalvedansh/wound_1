@@ -122,7 +122,10 @@ def projected_hours(a, folds: int, gpus: int, out: Path) -> float:
     per_epoch = secs[0] * (b_train + b_val / 3) / (min(20, b_train) + min(20, b_val) / 3)
     rounds = math.ceil(folds / max(1, gpus))
     seg_h = rounds * per_epoch * a.seg_epochs / 3600
-    cls_h = (0 if a.skip_cls else rounds * 6 / 60) + folds * 3 / 60  # classifier ~6 min per fold, evaluation ~3 min
+    # Classifier: measured ~6 min per fold for ~700 photos at 384 px on a T4; scales with the photo count.
+    n_cls = int((pd.read_csv(ROOT / a.cls_manifest if not Path(a.cls_manifest).is_absolute() else a.cls_manifest)
+                 .split != "test").sum()) if not a.skip_cls else 0
+    cls_h = rounds * 6 * max(1.0, n_cls / 700) / 60 + folds * 3 / 60  # + evaluation ~3 min per fold
     print(f"timing: {per_epoch:.0f} s per outline epoch at {a.seg_size}px; {folds} folds on {max(1, gpus)} GPU(s) "
           f"-> about {seg_h + cls_h:.1f} h (worst case: all {a.seg_epochs} epochs, no early stop)", flush=True)
     return seg_h + cls_h

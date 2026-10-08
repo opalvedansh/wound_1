@@ -82,6 +82,10 @@ Folder names above are examples; check each dataset's real layout after download
 
 Cross-validation instead of one split: `notebooks/kaggle_cv.ipynb` (runs `scripts/cv.py`, outline at 768 px).
 
+More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),
+deduplicated against each other and the locked test sets by `scripts/build_public_dataset.py`: about 4,820 photos
+for 7 wound types (burn, pressure, diabetic, venous, surgical, other, no wound) and 2,582 traced outlines.
+
 ## Serving
 
 ```bash

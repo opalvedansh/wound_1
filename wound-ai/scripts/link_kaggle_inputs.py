@@ -1,10 +1,13 @@
-"""Links the public wound datasets attached to a Kaggle notebook into data/raw/public/, where
-build_public_dataset.py expects them (same folder names as a local `kaggle datasets download`).
+"""Makes the public wound datasets available in data/raw/public/, where build_public_dataset.py expects them
+(same folder names as a local `kaggle datasets download`).
 
-    python scripts/link_kaggle_inputs.py                 # on Kaggle (inputs under /kaggle/input)
+Datasets attached to the Kaggle notebook as inputs are linked; any that aren't are downloaded with kagglehub
+(preinstalled on Kaggle; needs Internet on), so attaching inputs is optional.
+
+    python scripts/link_kaggle_inputs.py                 # on Kaggle
     python scripts/link_kaggle_inputs.py --input-root X  # anywhere else
 
-Attach these as notebook inputs (Add Input -> search the name):
+The datasets:
 """
 from __future__ import annotations
 
@@ -34,16 +37,31 @@ def find(root: Path, ref: str) -> Path | None:
     return None
 
 
+def download(ref: str) -> Path | None:
+    """Downloads a public Kaggle dataset with kagglehub (no sign-in needed for public datasets on Kaggle)."""
+    try:
+        import kagglehub
+
+        print(f"downloading {ref} ...", flush=True)
+        return Path(kagglehub.dataset_download(ref))
+    except Exception as e:  # not installed, offline, renamed
+        print(f"  could not download {ref}: {e}")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input-root", default="/kaggle/input")
     ap.add_argument("--out", default="data/raw/public")
+    ap.add_argument("--no-download", action="store_true", help="only link attached inputs, never download")
     a = ap.parse_args()
     root, out = Path(a.input_root), Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     missing = []
     for ref, local in DATASETS.items():
         src, dst = find(root, ref), out / local
+        if src is None and not a.no_download:
+            src = download(ref)
         if src is None:
             missing.append(ref)
             continue
@@ -53,7 +71,7 @@ def main():
             dst.symlink_to(src.resolve(), target_is_directory=True)
         print(f"linked {ref} -> {dst}")
     if missing:
-        sys.exit("Not attached (Add Input -> search the name, then run again):\n  " + "\n  ".join(missing))
+        sys.exit("Couldn't get (is Internet on in Session options?):\n  " + "\n  ".join(missing))
     print(f"all {len(DATASETS)} datasets linked")
 
 

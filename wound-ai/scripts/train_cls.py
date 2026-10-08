@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from wound_ai.data import ClassificationDataset, MetaEncoder
+from wound_ai.data import ClassificationDataset, MetaEncoder, cv_train_val
 from wound_ai.metrics import expected_calibration_error, macro_f1, per_class_sens_spec
 from wound_ai.models import TemperatureScaler, WoundClassifier, load_matching
 
@@ -47,6 +47,8 @@ def parse():
     p.add_argument("--out", default="runs/cls")
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--init", default="", help="start from this checkpoint (e.g. the public-data model)")
+    p.add_argument("--folds", type=int, default=0, help="cross-validation: number of folds (0 = use the manifest's train/val split)")
+    p.add_argument("--fold", type=int, default=0, help="cross-validation: which fold is validation (0-based)")
     p.add_argument("--max-batches", type=int, default=0)
     return p.parse_args()
 
@@ -72,7 +74,11 @@ def main():
     df = pd.read_csv(a.manifest)
     df = df[df[a.target].notna()]
     df[a.target] = df[a.target].astype(str)
-    train_df, val_df = df[df.split == "train"], df[df.split == "val"]
+    if a.folds:
+        # Folds balanced by wound type, so every fold sees every type in the same proportion.
+        train_df, val_df = cv_train_val(df, a.fold, a.folds, df[a.target])
+    else:
+        train_df, val_df = df[df.split == "train"], df[df.split == "val"]
     classes = sorted(train_df[a.target].unique().tolist())
     val_df = val_df[val_df[a.target].isin(classes)]
     meta_cols = [c for c in a.meta_cols.split(",") if c]
@@ -81,7 +87,8 @@ def main():
     tr = ClassificationDataset(train_df, a.target, classes, a.size, True, meta)
     va = ClassificationDataset(val_df, a.target, classes, a.size, False, meta)
     counts = train_df[a.target].value_counts().reindex(classes).fillna(0).values
-    print(f"classes {dict(zip(classes, counts.astype(int).tolist()))} | val {len(va)} | device {device}")
+    fold = f" | fold {a.fold + 1}/{a.folds}" if a.folds else ""
+    print(f"classes {dict(zip(classes, counts.astype(int).tolist()))} | val {len(va)} | device {device}{fold}")
 
     dl_tr = DataLoader(tr, a.batch_size, shuffle=True, num_workers=a.workers, drop_last=len(tr) > a.batch_size)
     dl_va = DataLoader(va, a.batch_size, shuffle=False, num_workers=a.workers)

@@ -24,7 +24,7 @@ import torch.nn as nn
 from segmentation_models_pytorch.losses import DiceLoss
 from torch.utils.data import DataLoader
 
-from wound_ai.data import TISSUE_CLASSES, SegmentationDataset
+from wound_ai.data import TISSUE_CLASSES, SegmentationDataset, cv_train_val, wound_size_bins
 from wound_ai.models import build_seg_model, load_matching
 
 
@@ -45,6 +45,8 @@ def parse():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--no-pretrained", action="store_true")
     p.add_argument("--init", default="", help="start from this checkpoint (e.g. the public-data model)")
+    p.add_argument("--folds", type=int, default=0, help="cross-validation: number of folds (0 = use the manifest's train/val split)")
+    p.add_argument("--fold", type=int, default=0, help="cross-validation: which fold is validation (0-based)")
     p.add_argument("--max-batches", type=int, default=0, help="debug: limit batches per epoch")
     return p.parse_args()
 
@@ -78,9 +80,15 @@ def main():
     mask_col = "mask_path" if binary else "tissue_path"
 
     df = pd.read_csv(a.manifest)
-    tr = SegmentationDataset(df[df.split == "train"], a.size, True, mask_col, binary)
-    va = SegmentationDataset(df[df.split == "val"], a.size, False, mask_col, binary)
-    print(f"train {len(tr)} | val {len(va)} | device {device}")
+    if a.folds:
+        # Folds balanced by wound size, so no fold gets all the tiny wounds.
+        train_df, val_df = cv_train_val(df, a.fold, a.folds, wound_size_bins(df, mask_col))
+    else:
+        train_df, val_df = df[df.split == "train"], df[df.split == "val"]
+    tr = SegmentationDataset(train_df, a.size, True, mask_col, binary)
+    va = SegmentationDataset(val_df, a.size, False, mask_col, binary)
+    fold = f" | fold {a.fold + 1}/{a.folds}" if a.folds else ""
+    print(f"train {len(tr)} | val {len(va)} | size {a.size} | batch {a.batch_size} | device {device}{fold}")
     dl_tr = DataLoader(tr, a.batch_size, shuffle=True, num_workers=a.workers, drop_last=len(tr) > a.batch_size,
                        pin_memory=device == "cuda")
     dl_va = DataLoader(va, a.batch_size, shuffle=False, num_workers=a.workers)

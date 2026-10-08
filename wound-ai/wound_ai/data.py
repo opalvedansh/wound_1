@@ -190,3 +190,36 @@ def patient_level_split(df: pd.DataFrame, val_frac: float = 0.15, test_frac: flo
         "test" if p in test else "val" if p in val else "train" for p in df["patient_id"].astype(str)
     ]
     return df
+
+
+# --------------------------------------------------------------------------- cross-validation
+
+def wound_size_bins(df: pd.DataFrame, mask_col: str = "mask_path") -> pd.Series:
+    """Tiny / small / large wound (share of the photo), to balance segmentation folds. Rows without a mask: 'none'."""
+    def size_bin(path) -> str:
+        p = str(path or "")
+        if not p or p == "nan":
+            return "none"
+        share = float(read_mask(p, binary=True).mean())
+        return "empty" if share == 0 else "tiny" if share < 0.01 else "small" if share < 0.05 else "large"
+    return df[mask_col].map(size_bin)
+
+
+def cv_train_val(df: pd.DataFrame, fold: int, folds: int, strat: pd.Series | None = None,
+                 seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train and validation rows for one cross-validation fold.
+
+    The locked test split is never touched: folds are made from the remaining (train + val) rows, grouped by
+    patient so one patient's photos stay in one fold, and stratified by `strat` (wound type, or wound size) so
+    every fold sees the same mix. Deterministic for a given seed, so every script gets the same folds.
+    """
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    if not 0 <= fold < folds:
+        raise ValueError(f"fold must be in 0..{folds - 1}")
+    pool = df[df.split != "test"].reset_index(drop=True)
+    y = (strat.loc[df.split != "test"].astype(str).to_numpy() if strat is not None else np.zeros(len(pool), dtype=str))
+    groups = pool["patient_id"].fillna(pool["image_path"]).astype(str).to_numpy()
+    splitter = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=seed)
+    tr_idx, va_idx = list(splitter.split(np.zeros(len(pool)), y, groups))[fold]
+    return pool.iloc[tr_idx], pool.iloc[va_idx]

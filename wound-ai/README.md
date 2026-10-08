@@ -35,6 +35,7 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 | `scripts/train_seg.py` | Wound boundary or tissue segmentation (resumable for Kaggle time limits) |
 | `scripts/train_cls.py` | Any label column (wound type, PU stage, burn depth, DFU infection) + calibration |
 | `scripts/evaluate.py` | Test-set metrics with 95% CIs, subgroup breakdown, area agreement |
+| `scripts/cv.py` | K-fold cross-validation (grouped by patient, stratified), timed first: 5 folds if they fit the budget, else 3; folds in parallel across GPUs; mean ± sd on the locked test set |
 | `scripts/finetune_medgemma.py` | QLoRA fine-tune of the summary writer on clinician-approved text |
 | `scripts/make_marker.py` | Printable A4 sheet of 20 mm calibration stickers |
 | `scripts/smoke_test.py` | Synthetic end-to-end test of every piece (CPU, under a minute) |
@@ -78,6 +79,8 @@ python scripts/evaluate.py --manifest /kaggle/working/manifest.csv --ckpt-dir ch
 ```
 
 Folder names above are examples; check each dataset's real layout after download.
+
+Cross-validation instead of one split: `notebooks/kaggle_cv.ipynb` (runs `scripts/cv.py`, outline at 768 px).
 
 ## Serving
 

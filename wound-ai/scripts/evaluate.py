@@ -9,6 +9,10 @@ darker skin or on one hospital's phones is not ready.
 
 Optional manifest column `area_cm2_manual` (clinician tracing) enables a
 measurement-agreement check (bias and 95% limits of agreement).
+
+Tissue (rows with `tissue_path`): Dice per class, the error in each tissue's share of the wound bed, and agreement
+on the decision the care rules make from it (non-viable tissue at or above NONVIABLE_DEBRIDE_PCT). Compare these
+with two clinicians' agreement on the same photos: the model is ready only if it is not clearly worse.
 """
 from __future__ import annotations
 
@@ -22,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 import pandas as pd
 
-from wound_ai.data import crop_to_wound, read_mask, read_rgb
+from wound_ai.data import IGNORE_INDEX, WOUND_BED, annotated_classes, crop_to_wound, read_mask, read_rgb
 from wound_ai.measure import find_marker, measure_wound
-from wound_ai.metrics import (bootstrap_ci, dice_iou, expected_calibration_error, macro_auroc, macro_f1,
+from wound_ai.metrics import (bootstrap_ci, cohen_kappa, dice_iou, expected_calibration_error, macro_auroc, macro_f1,
                               per_class_sens_spec)
 from wound_ai.pipeline import WoundAnalyzer
 
@@ -84,6 +88,9 @@ def main():
             }
         res["components"]["boundary"] = out
 
+    if "tissue" in an.seg:
+        res["components"]["tissue"] = evaluate_tissue(an, df, preds_mask, groups, a.use_gt_mask)
+
     for name, c in an.cls.items():
         target = c["cfg"]["target"]
         if target not in df.columns:
@@ -117,6 +124,57 @@ def main():
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     Path(a.out).write_text(json.dumps(res, indent=1, default=str))
     print(json.dumps(res, indent=1, default=str))
+
+
+def evaluate_tissue(an: WoundAnalyzer, df: pd.DataFrame, preds_mask: dict, groups: list[str], use_gt: bool) -> dict:
+    from wound_ai.care import NONVIABLE_DEBRIDE_PCT
+
+    classes = an.tissue_classes()
+    bed_ids = [classes.index(c) for c in WOUND_BED if c in classes]
+    nonviable_ids = [classes.index(c) for c in ("slough", "necrosis") if c in classes]
+    per_class = {c: [] for c in classes[1:]}
+    photos = {c: 0 for c in classes[1:]}  # test photos that contain each class
+    rows, n = [], 0
+    for i, r in df.iterrows():
+        tp, mp = str(r.get("tissue_path", "") or ""), str(r.get("mask_path", "") or "")
+        if not tp or tp == "nan":
+            continue
+        img, gt = read_rgb(r.image_path), read_mask(tp, binary=False)
+        gt_bed = np.isin(gt, bed_ids)
+        mask = read_mask(mp, True) if use_gt and mp and mp != "nan" else preds_mask.get(i)
+        if mask is None:
+            mask = gt_bed.astype(np.uint8)  # no boundary model or mask: crop with the annotated wound bed
+        pred, _ = an._tissue_map(img, mask)
+        n += 1
+        valid = gt != IGNORE_INDEX
+        # Each dataset labels some classes only: a class is scored only on photos whose dataset labels it.
+        labelled = annotated_classes(r.get("tissue_classes")).tolist()
+        for k, c in enumerate(classes[1:], start=1):
+            if k >= len(labelled) or not labelled[k]:
+                continue
+            p, t = (pred == k) & valid, gt == k
+            photos[c] += int(t.any())
+            if p.any() or t.any():
+                per_class[c].append(2 * float((p & t).sum()) / float(p.sum() + t.sum()))
+        if not all(labelled[classes.index(c)] for c in ("slough", "necrosis") if c in classes):
+            continue  # the non-viable share needs both labelled
+        # Shares of the wound bed: annotated bed and annotated tissue against the app's outline and prediction.
+        gt_nv = 100 * np.isin(gt[gt_bed], nonviable_ids).mean() if gt_bed.any() else np.nan
+        pr_bed = pred[mask > 0]
+        pr_bed = pr_bed[np.isin(pr_bed, bed_ids)]
+        pr_nv = 100 * np.isin(pr_bed, nonviable_ids).mean() if len(pr_bed) else np.nan
+        rows.append({"nonviable_gt": gt_nv, "nonviable_pred": pr_nv, **{g: r[g] for g in groups}})
+    s = pd.DataFrame(rows).dropna(subset=["nonviable_gt", "nonviable_pred"]) if rows else pd.DataFrame()
+    out = {"n": n, "dice_per_class": {c: bootstrap_ci(np.mean, np.array(v)) for c, v in per_class.items() if v},
+           "photos_per_class": {c: n for c, n in photos.items() if n}}
+    if len(s):
+        s = s.assign(err=(s.nonviable_pred - s.nonviable_gt).abs(),
+                     debride_gt=s.nonviable_gt >= NONVIABLE_DEBRIDE_PCT, debride_pred=s.nonviable_pred >= NONVIABLE_DEBRIDE_PCT)
+        out["nonviable_abs_error_points"] = bootstrap_ci(np.mean, s.err.values)
+        out["debridement_threshold"] = {"agreement": round(float((s.debride_gt == s.debride_pred).mean()), 3),
+                                        "kappa": cohen_kappa(s.debride_gt.values.astype(int), s.debride_pred.values.astype(int))}
+        out["nonviable_error_by_group"] = {g: s.groupby(g).err.agg(["mean", "count"]).round(1).to_dict("index") for g in groups}
+    return out
 
 
 if __name__ == "__main__":

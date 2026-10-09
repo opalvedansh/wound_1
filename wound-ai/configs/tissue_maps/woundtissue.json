@@ -1,0 +1,13 @@
+{
+  "source": "woundtissue",
+  "_note": "github.com/akabircs/WoundTissue (CC BY-NC-SA 4.0). RGB label colours from its README, checked against the 14 published label images (exactly these 6 colours). Tendon (sky blue) does not occur in them, so its colour is unknown: unlisted colours are ignored. No epithelium label: the partial-label loss handles that. The published images are wound cut-outs: everything outside the wound is painted the same pure blue as the label background, so background is ignored (the model must not learn painted-out skin).",
+  "values": {
+    "0,0,255": "ignore",
+    "255,0,0": "granulation",
+    "255,255,0": "slough",
+    "0,0,0": "necrosis",
+    "255,255,255": "maceration",
+    "255,200,124": "exposed_structure"
+  },
+  "unlisted": "ignore"
+}

@@ -3,7 +3,8 @@
     python scripts/make_marker.py --mm 20 --count 12 --out markers.pdf
 
 Print at 100% ("actual size", never "fit to page"), then check the 50 mm bar with
-a ruler. Laminate or print on matte sticker paper (gloss causes glare). Use a new
+a ruler. Each sticker is the marker plus a neutral grey square beside it (cut them out
+together): the app corrects the photo's colour cast from the grey before judging tissue. Laminate or print on matte sticker paper (gloss causes glare). Use a new
 sticker per patient, or disinfect per local infection-control policy.
 """
 from __future__ import annotations
@@ -18,7 +19,9 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from wound_ai.measure import ARUCO_DICT
+from wound_ai.measure import ARUCO_DICT, GREY_GAP_MM
+
+GREY = 128  # neutral mid grey, printed with black ink only
 
 
 def main():
@@ -36,14 +39,17 @@ def main():
     page = np.full((page_h, page_w), 255, np.uint8)
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICT))
 
-    cols = max(1, (page_w - gap) // (side + gap))
+    patch_gap = int(round(GREY_GAP_MM * px_per_mm))
+    unit = 2 * side + patch_gap  # marker + grey patch
+    cols = max(1, (page_w - gap) // (unit + gap))
     y0, x0 = int(25 * px_per_mm), gap
     for i in range(a.count):
         r, c = divmod(i, cols)
-        y, x = y0 + r * (side + gap), x0 + c * (side + gap)
+        y, x = y0 + r * (side + gap), x0 + c * (unit + gap)
         if y + side > page_h - int(40 * px_per_mm):
             break
         page[y:y + side, x:x + side] = cv2.aruco.generateImageMarker(dictionary, i, side, borderBits=1)
+        page[y:y + side, x + side + patch_gap:x + unit] = GREY
         cv2.putText(page, f"id {i}", (x, y + side + int(4 * px_per_mm)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, 0, 2)
 
     bar_y = page_h - int(25 * px_per_mm)

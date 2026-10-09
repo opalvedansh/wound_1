@@ -125,3 +125,72 @@ def test_black_letterbox_borders_are_not_glare():
     q = check_quality(padded)
     assert q.ok, q.issues
     assert q.metrics["clipped_frac"] < 0.01
+
+
+def test_post_photo_skips_follow_ups_and_rejects_unknown_phases(client):
+    h = {"X-API-Key": KEY}
+    files = {"image": ("w.jpg", textured_photo(), "image/jpeg")}
+    r = client.post("/analyze", files=files, data={"intake": json.dumps(INTAKE), "phase": "post"}, headers=h)
+    assert r.status_code == 200 and r.json()["phase"] == "post"
+    assert "follow_up_questions" not in r.json()
+    files = {"image": ("w.jpg", textured_photo(), "image/jpeg")}
+    assert client.post("/analyze", files=files, data={"intake": json.dumps(INTAKE), "phase": "x"}, headers=h).status_code == 400
+
+
+def test_treatment_report_from_one_analysed_photo(client):
+    f = analyze(client, textured_photo()).json()
+    from wound_ai.progress import observation
+
+    body = {"wound_type": f.get("wound_type"), "intake": INTAKE,
+            "treatments": [{"sequence": 1, "pre": observation(f, "2026-01-01T10:00:00+00:00"),
+                            "assessment": {"exudate_level": "Heavy"}}]}
+    assert client.post("/treatment-report", json=body).status_code == 401
+    r = client.post("/treatment-report", json=body, headers={"X-API-Key": KEY})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["progress"]["healing"]["comparable"] is False
+    assert any(s["action"] == "Alginate" for s in out["suggestions"])
+    assert out["rules_version"] and "# Treatment 1 assessment" in out["report_markdown"]
+    assert client.post("/treatment-report", json={"treatments": []}, headers={"X-API-Key": KEY}).status_code == 400
+
+
+def test_overlay_needs_the_key_and_explains_when_there_is_no_outline(client):
+    files = lambda: {"image": ("w.jpg", textured_photo(), "image/jpeg")}  # noqa: E731
+    assert client.post("/analyze/overlay", files=files()).status_code == 401
+    r = client.post("/analyze/overlay", files=files(), headers={"X-API-Key": KEY})
+    assert r.status_code == 422  # no outline model in this test setup
+    assert r.json()["detail"]["detail"] == "no outline to draw"
+
+
+def test_overlay_draws_the_outline_where_the_model_put_it():
+    from wound_ai.pipeline import draw_overlay
+
+    img = np.full((200, 400, 3), 120, np.uint8)
+    out = draw_overlay(img, {"outline": [[[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]],
+                             "tissue_outline": {"slough": [[[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]]]}},
+                       tissue=True)
+    assert tuple(out[100, 100]) == (57, 255, 20)        # on the outline (x = 0.25 of 400)
+    assert out[10, 10].tolist() == [120, 120, 120]      # outside: untouched
+    assert out[100, 200, 0] > out[100, 200, 2] + 40     # inside the slough patch: yellow tint
+    plain = draw_overlay(img, {"outline": [[[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]]]})
+    assert abs(int(plain[100, 200, 0]) - int(plain[100, 200, 2])) < 10  # no tissue layer: only the faint green fill
+
+
+def test_small_or_soft_photos_are_analysed_with_a_quality_warning(client):
+    rng = np.random.default_rng(2)
+    small = cv2.GaussianBlur(rng.integers(40, 210, (300, 400, 3), dtype=np.uint8), (7, 7), 0)
+    f = analyze(client, jpeg(small)).json()
+    assert f["status"] == "ok", f.get("quality")
+    assert "low_resolution" in f["quality"]["warnings"]
+    assert any(fl["text"].startswith("Photo quality (low resolution") for fl in f["flags"])
+    assert "report_markdown" in f
+
+
+def test_only_photos_with_nothing_to_analyse_are_refused():
+    from wound_ai.quality import check_quality
+    rng = np.random.default_rng(3)
+    assert not check_quality(np.full((600, 800, 3), 3, np.uint8)).usable                       # black
+    assert not check_quality(rng.integers(0, 255, (60, 80, 3), dtype=np.uint8)).usable          # thumbnail
+    small = rng.integers(40, 210, (320, 320, 3), dtype=np.uint8)
+    q = check_quality(small)
+    assert q.usable and "blurry" not in q.warnings  # a sharp small photo is not called blurry (no upscaling)

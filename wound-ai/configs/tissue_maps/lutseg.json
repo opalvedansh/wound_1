@@ -1,0 +1,14 @@
+{
+  "source": "lutseg",
+  "_note": "LUTSeg (Hugging Face ksanchez84/LUTSeg, CC BY 4.0), leprosy-related ulcers. class_map.json: 0 background, 1 Epithelial, 2 Slough, 3 Granulation, 4 Necrotic, 5 Other, 255 ignore. 'Other' is not one of our classes, so it is ignored.",
+  "values": {
+    "0": "background",
+    "1": "epithelial",
+    "2": "slough",
+    "3": "granulation",
+    "4": "necrosis",
+    "5": "ignore",
+    "255": "ignore"
+  },
+  "unlisted": "ignore"
+}

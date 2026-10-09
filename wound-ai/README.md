@@ -25,13 +25,21 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 |---|---|
 | `wound_ai/data.py` | Manifest-driven datasets, colour-safe augmentations, **patient-level** splits |
 | `wound_ai/models.py` | SegFormer/U-Net builders, image+metadata classifier, temperature scaling |
-| `wound_ai/quality.py` | Rejects blurry / dark / glare photos with a retake instruction |
+| `wound_ai/quality.py` | Warns about low-resolution / blurry / dark / glare photos (analysed, flagged for review); refuses only photos with nothing to analyse |
 | `wound_ai/measure.py` | ArUco sticker → homography → area, length, width, perimeter, % change |
 | `wound_ai/intake.py` | Questions the app asks, with adaptive follow-ups (burn, surgical, pressure, diabetic) |
 | `wound_ai/report.py` | Red-flag rules (placeholders for clinical sign-off), template report, LLM guard |
+| `wound_ai/progress.py` | Healing visit to visit (like with like: after-cleaning photos), what a session's debridement did, 4-week check, PUSH |
+| `wound_ai/care.py` | Care suggestions from a rule table (TIME framework, contraindications; placeholders for sign-off), the treatment report |
 | `wound_ai/llm.py` | MedGemma loading and summary generation (optional) |
 | `wound_ai/pipeline.py` | `WoundAnalyzer`: everything above, end to end |
 | `scripts/prepare_data.py` | Merge datasets into one manifest; near-duplicate grouping to stop leakage |
+| `scripts/repeatability.py` | Measurement noise from a repeat-photo study (docs/repeatability_study.md); `--write` makes healing use it |
+| `scripts/build_tissue_dataset.py` | The three public tissue datasets mapped to our classes, locked test set, unlabelled pool, clinician agreement |
+| `scripts/pseudo_label.py` | A trained tissue model labels unlabelled photos where it is confident (semi-supervised training) |
+| `scripts/tissue_cv.py` | Tissue model: per fold teacher → pseudo-labels → student, scored on the locked test set against clinician agreement |
+| `wound_ai/losses.py` | Partial-label losses: each image only teaches the tissue classes its dataset labels |
+| `scripts/prepare_tissue.py` | Rewrite a tissue dataset's masks into this project's tissue classes (map file per dataset) |
 | `scripts/train_seg.py` | Wound boundary or tissue segmentation (resumable for Kaggle time limits) |
 | `scripts/train_cls.py` | Any label column (wound type, PU stage, burn depth, DFU infection) + calibration |
 | `scripts/evaluate.py` | Test-set metrics with 95% CIs, subgroup breakdown, area agreement |
@@ -82,6 +90,12 @@ Folder names above are examples; check each dataset's real layout after download
 
 Cross-validation instead of one split: `notebooks/kaggle_cv.ipynb` (runs `scripts/cv.py`, outline at 768 px).
 
+Tissue model: `notebooks/kaggle_tissue_cv.ipynb` (runs `scripts/tissue_cv.py`). Only ~265 tissue-labelled photos exist
+publicly (DFUTissue, LUTSeg, WoundTissue), so it is semi-supervised: a teacher labels a pool of ~11,400 other wound
+photos (the public datasets + DFUC2022 + post-operative wounds, deduplicated; `link_kaggle_inputs.py --set pool`) where
+it is confident and a student learns from both. Classes are scored against how well five clinicians agree with
+each other (LUTSeg's gold standard), and the app uses only the classes that come close (`trusted_classes`).
+
 More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),
 deduplicated against each other and the locked test sets by `scripts/build_public_dataset.py`: about 4,820 photos
 for 7 wound types (burn, pressure, diabetic, venous, surgical, other, no wound) and 2,582 traced outlines.
@@ -93,6 +107,10 @@ WOUND_API_KEY=change-me CKPT_DIR=checkpoints uvicorn api.server:app --port 8000
 curl -H "X-API-Key: change-me" -F image=@photo.jpg \
   -F 'intake={"body_location":"heel","diabetes":"yes","cause":"started_on_its_own"}' localhost:8000/analyze
 ```
+
+`POST /analyze` takes `phase=pre|post` (post: after cleaning, before the dressing, same visit). `POST /treatment-report`
+takes a wound's analysed photos so far (JSON, no images) and returns healing, care suggestions and the treatment's draft;
+see `wound_ai.care.treatment_report`.
 
 Every route except `/health` needs the `X-API-Key` header, and the API refuses all requests if
 `WOUND_API_KEY` is unset. `diabetes` and `cause` are required answers (HTTP 400 without them).
@@ -116,5 +134,11 @@ results, and serves the web portal.
   banned phrase (doses, "diagnosed", "prescribe", …).
 - No size is reported without the calibration sticker.
 - Low-confidence classifications are reported as **uncertain** with the top alternatives.
-- The red-flag rules in `report.py` are placeholders. Your clinical partner signs them off.
+- The red-flag rules in `report.py`, the care rules in `care.py` and the thresholds in `progress.py` are placeholders.
+  Your clinical partner signs them off; bump `RULES_VERSION` on every change.
+- Care suggestions come from the rule table, never from the language model; each names the finding behind it, and
+  contraindications (e.g. compression without an ABPI) remove any suggestion they conflict with.
+- Healing compares like with like (after-cleaning photos), only with the sticker in both, and calls changes inside
+  the measurement noise static: a placeholder ±15% until `scripts/repeatability.py --write` saves the band measured
+  by a repeat-photo study to `wound_ai/measurement_noise.json`. Every healing result names which one it used.
 - The API stores nothing unless `STORE_CASES=1` (only inside an ethics-approved, consented study).

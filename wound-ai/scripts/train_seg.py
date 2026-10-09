@@ -5,6 +5,12 @@ Free Kaggle/Colab GPU (T4/P100, 16 GB):
         --arch segformer --encoder mit_b2 --size 512 --batch-size 8 --epochs 60 --out runs/boundary
 
 Sessions time out, so a checkpoint is written every epoch. Restart with --resume.
+
+Tissue: train on the wound's box (--crop, as the app crops with its predicted outline), start from the boundary
+model's encoder, and weight the rare classes:
+    python scripts/train_seg.py --manifest data/manifest.csv --task tissue --crop --init checkpoints/boundary.pt \
+        --class-weights 0.5,1,1.5,3,1.5,1.5,2,4 --out runs/tissue
+Tissue mask pixels of 255 are ignored (an unsure annotator, or a public dataset's class we don't use).
 """
 from __future__ import annotations
 
@@ -24,7 +30,8 @@ import torch.nn as nn
 from segmentation_models_pytorch.losses import DiceLoss
 from torch.utils.data import DataLoader
 
-from wound_ai.data import TISSUE_CLASSES, SegmentationDataset, cv_train_val, wound_size_bins
+from wound_ai.data import IGNORE_INDEX, TISSUE_CLASSES, TISSUE_CROP_MARGIN, SegmentationDataset, cv_train_val, wound_size_bins
+from wound_ai.losses import partial_label_ce, partial_label_dice
 from wound_ai.models import build_seg_model, load_matching
 
 
@@ -48,21 +55,32 @@ def parse():
     p.add_argument("--folds", type=int, default=0, help="cross-validation: number of folds (0 = use the manifest's train/val split)")
     p.add_argument("--fold", type=int, default=0, help="cross-validation: which fold is validation (0-based)")
     p.add_argument("--max-batches", type=int, default=0, help="debug: limit batches per epoch")
+    p.add_argument("--crop", action="store_true", help="tissue: train on the wound's box plus a margin")
+    p.add_argument("--class-weights", default="", help="tissue: comma-separated loss weight per class "
+                   f"({','.join(TISSUE_CLASSES)})")
+    p.add_argument("--extra-train", default="", help="CSV of rows added to training only, never to validation "
+                   "(e.g. pseudo-labelled photos from scripts/pseudo_label.py)")
     return p.parse_args()
 
 
-def dice_scores(logits: torch.Tensor, target: torch.Tensor, binary: bool, k: int) -> list[float]:
-    """Per-image Dice for binary; per-class (pooled over the batch) for multi-class."""
+def dice_scores(logits: torch.Tensor, target: torch.Tensor, binary: bool, k: int,
+                annotated: torch.Tensor | None = None) -> list[float]:
+    """Per-image Dice for binary; per-class (pooled over the batch) for multi-class, each class counted only on the
+    images whose dataset labels it (annotated B,K)."""
     if binary:
         pred = (torch.sigmoid(logits) > 0.5).float()
         inter = (pred * target).sum((1, 2, 3))
         denom = pred.sum((1, 2, 3)) + target.sum((1, 2, 3))
         d = torch.where(denom > 0, 2 * inter / denom.clamp(min=1e-7), torch.ones_like(denom))
         return d.tolist()
+    valid = target != IGNORE_INDEX
     pred = logits.argmax(1)
     out = []
     for c in range(1, k):
-        p, t = pred == c, target == c
+        rows = annotated[:, c] if annotated is not None else torch.ones(len(target), dtype=torch.bool, device=target.device)
+        if not rows.any():
+            continue
+        p, t = ((pred == c) & valid)[rows], (target == c)[rows]
         denom = p.sum() + t.sum()
         if denom > 0:
             out.append(float(2 * (p & t).sum() / denom))
@@ -76,17 +94,26 @@ def main():
     # NVIDIA GPU (Kaggle), then Apple GPU (a Mac), then CPU. Mixed precision stays CUDA-only.
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     binary = a.task == "boundary"
+    if binary and (a.crop or a.class_weights or a.extra_train):
+        raise SystemExit("--crop, --class-weights and --extra-train are for --task tissue")
     k = 1 if binary else len(TISSUE_CLASSES)
     mask_col = "mask_path" if binary else "tissue_path"
 
     df = pd.read_csv(a.manifest)
     if a.folds:
         # Folds balanced by wound size, so no fold gets all the tiny wounds.
-        train_df, val_df = cv_train_val(df, a.fold, a.folds, wound_size_bins(df, mask_col))
+        # Outline folds are balanced by wound size; tissue folds by dataset, as each labels different classes.
+        strat = wound_size_bins(df, mask_col) if binary else df["source"].fillna("unknown")
+        train_df, val_df = cv_train_val(df, a.fold, a.folds, strat)
     else:
         train_df, val_df = df[df.split == "train"], df[df.split == "val"]
-    tr = SegmentationDataset(train_df, a.size, True, mask_col, binary)
-    va = SegmentationDataset(val_df, a.size, False, mask_col, binary)
+    if a.extra_train:
+        extra = pd.read_csv(a.extra_train)
+        print(f"+ {len(extra)} extra training rows from {a.extra_train} (never validated on)")
+        if len(extra):
+            train_df = pd.concat([train_df, extra], ignore_index=True)
+    tr = SegmentationDataset(train_df, a.size, True, mask_col, binary, crop=a.crop)
+    va = SegmentationDataset(val_df, a.size, False, mask_col, binary, crop=a.crop)
     fold = f" | fold {a.fold + 1}/{a.folds}" if a.folds else ""
     print(f"train {len(tr)} | val {len(va)} | size {a.size} | batch {a.batch_size} | device {device}{fold}")
     dl_tr = DataLoader(tr, a.batch_size, shuffle=True, num_workers=a.workers, drop_last=len(tr) > a.batch_size,
@@ -99,7 +126,17 @@ def main():
     if binary:
         dice_loss, px_loss = DiceLoss("binary", from_logits=True), nn.BCEWithLogitsLoss()
     else:
-        dice_loss, px_loss = DiceLoss("multiclass", from_logits=True), nn.CrossEntropyLoss()
+        weights = None
+        if a.class_weights:
+            weights = torch.tensor([float(w) for w in a.class_weights.split(",")], device=device)
+            if len(weights) != k:
+                raise SystemExit(f"--class-weights needs {k} values, one per class: {TISSUE_CLASSES}")
+        # Partial-label losses: each image only teaches the classes its dataset labels (wound_ai/losses.py).
+        def dice_loss(logits, y, ann):
+            return partial_label_dice(logits, y, ann)
+
+        def px_loss(logits, y, ann):
+            return partial_label_ce(logits, y, ann, weights)
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
     steps_per_epoch = max(1, len(dl_tr) if not a.max_batches else min(a.max_batches, len(dl_tr)))
@@ -117,19 +154,26 @@ def main():
         start, best, bad = ck["epoch"] + 1, ck["best"], ck["bad"]
         print(f"resumed at epoch {start}, best {best:.4f}")
 
-    cfg = {"arch": a.arch, "encoder": a.encoder, "num_classes": k, "size": a.size, "task": a.task}
+    cfg = {"arch": a.arch, "encoder": a.encoder, "num_classes": k, "size": a.size, "task": a.task,
+           # The app crops the same way before running the model (pipeline.py), with the middle margin.
+           "crop_margin": sum(TISSUE_CROP_MARGIN) / 2 if a.crop else None,
+           **({} if binary else {"classes": TISSUE_CLASSES})}
     log = out / "history.csv"
     for ep in range(start, a.epochs):
         t0 = time.time()
         model.train()
         losses = []
-        for i, (x, y) in enumerate(dl_tr):
+        for i, (x, y, *ann) in enumerate(dl_tr):
             if a.max_batches and i >= a.max_batches:
                 break
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.amp.autocast(device_type=device, enabled=device == "cuda"):
                 logits = model(x)
-                loss = dice_loss(logits, y) + px_loss(logits, y)
+                if binary:
+                    loss = dice_loss(logits, y) + px_loss(logits, y)
+                else:
+                    ann = ann[0].to(device)
+                    loss = dice_loss(logits, y, ann) + px_loss(logits, y, ann)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -140,12 +184,12 @@ def main():
         model.eval()
         scores = []
         with torch.no_grad():
-            for i, (x, y) in enumerate(dl_va):
+            for i, (x, y, *ann) in enumerate(dl_va):
                 if a.max_batches and i >= a.max_batches:
                     break
                 with torch.amp.autocast(device_type=device, enabled=device == "cuda"):
                     logits = model(x.to(device))
-                scores += dice_scores(logits.float(), y.to(device), binary, k)
+                scores += dice_scores(logits.float(), y.to(device), binary, k, ann[0].to(device) if ann else None)
         val = float(np.mean(scores)) if scores else 0.0
         print(f"epoch {ep:3d} loss {np.mean(losses):.4f} val_dice {val:.4f} ({time.time() - t0:.0f}s)")
 

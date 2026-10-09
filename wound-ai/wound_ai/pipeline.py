@@ -20,15 +20,21 @@ import cv2
 import numpy as np
 import torch
 
-from .data import IMAGENET_MEAN, IMAGENET_STD, TISSUE_CLASSES, MetaEncoder, crop_to_wound, read_rgb
+from .data import (IMAGENET_MEAN, IMAGENET_STD, PERIWOUND, TISSUE_CLASSES, WOUND_BED, MetaEncoder, crop_to_wound,
+                   read_rgb, wound_box)
 from .intake import FOOT_SITES
-from .measure import area_change, find_marker, measure_wound
+from .measure import area_change, find_marker, grey_patch_gains, measure_wound
 from .models import WoundClassifier, build_seg_model
 from .quality import check_quality
 from .report import build_report, red_flags
 
 SEVERITY_HEADS = {"pu_stage": "pressure", "burn_depth": "burn", "dfu_infection": "diabetic"}
-WOUND_BED = ["granulation", "slough", "necrosis", "epithelial"]
+# Mean tissue-model confidence over the wound bed below which the tissue mix is reported as uncertain and not used
+# by the healing or care rules. PLACEHOLDER: set from validation (confidence against accuracy on held-out photos).
+TISSUE_MIN_CONFIDENCE = 0.6
+# A class the tissue model is not trusted on is mentioned ("possible maceration: check") when it covers this share of
+# the wound and the skin around it.
+UNTRUSTED_MENTION_FRAC = 0.05
 # Outline regions smaller than this share of the photo are specks, not wound (works without a sticker).
 MIN_OUTLINE_FRAC = 0.0005
 
@@ -58,6 +64,34 @@ def mask_outline(mask: np.ndarray | None) -> list[list[list[float]]] | None:
         if len(points) >= 3:
             polygons.append([[round(float(x) / w, 4), round(float(y) / h, 4)] for x, y in points])
     return polygons or None
+
+
+# Same colours as the portal (apps/web VisitResult.tsx TISSUE_COLOR), as RGB.
+OUTLINE_RGB = (57, 255, 20)
+TISSUE_RGB = {"granulation": (225, 29, 72), "slough": (234, 179, 8), "necrosis": (17, 24, 39),
+              "epithelial": (249, 168, 212), "exposed_structure": (248, 250, 252),
+              "periwound_erythema": (249, 115, 22), "maceration": (147, 197, 253), "callus": (163, 230, 53)}
+
+
+def draw_overlay(img: np.ndarray, findings: dict, tissue: bool = False) -> np.ndarray:
+    """The photo (RGB) with the wound outline, and optionally the tissue layers, drawn as the portal draws them."""
+    h, w = img.shape[:2]
+
+    def pts(polygon):
+        return np.array([[round(x * w), round(y * h)] for x, y in polygon], np.int32)
+
+    out = img.copy()
+    layers = [(TISSUE_RGB.get(c, (168, 85, 247)), polys, 0.45, max(1, w // 600))
+              for c, polys in ((findings.get("tissue_outline") or {}).items() if tissue else [])]
+    layers.append((OUTLINE_RGB, findings.get("outline") or [], 0.12, max(2, w // 300)))
+    for colour, polygons, alpha, width in layers:
+        if not polygons:
+            continue
+        fill = out.copy()
+        cv2.fillPoly(fill, [pts(p) for p in polygons], colour)
+        out = cv2.addWeighted(fill, alpha, out, 1 - alpha, 0)
+        cv2.polylines(out, [pts(p) for p in polygons], True, colour, width, cv2.LINE_AA)
+    return out
 
 
 def _letterbox(img: np.ndarray, size: int):
@@ -111,17 +145,74 @@ class WoundAnalyzer:
 
     # ------------------------------------------------------------------ inference
     @torch.no_grad()
-    def _segment(self, img: np.ndarray, name: str) -> np.ndarray:
+    def _segment(self, img: np.ndarray, name: str, with_confidence: bool = False):
         s = self.seg[name]
         size = s["cfg"]["size"]
         lb, (top, left, nh, nw) = _letterbox(img, size)
         logits = s["model"](_to_tensor(lb).to(self.device))[0]
         if s["cfg"]["num_classes"] == 1:
-            pred = (torch.sigmoid(logits[0]) > 0.5).cpu().numpy().astype(np.uint8)
+            prob = torch.sigmoid(logits[0])
+            pred, conf = (prob > 0.5), torch.maximum(prob, 1 - prob)
         else:
-            pred = logits.argmax(0).cpu().numpy().astype(np.uint8)
-        pred = pred[top:top + nh, left:left + nw]
-        return cv2.resize(pred, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            conf, pred = torch.softmax(logits, 0).max(0)
+        size_back = (img.shape[1], img.shape[0])
+        pred = cv2.resize(pred.cpu().numpy().astype(np.uint8)[top:top + nh, left:left + nw], size_back,
+                          interpolation=cv2.INTER_NEAREST)
+        if not with_confidence:
+            return pred
+        conf = cv2.resize(conf.float().cpu().numpy()[top:top + nh, left:left + nw], size_back,
+                          interpolation=cv2.INTER_LINEAR)
+        return pred, conf
+
+    def tissue_classes(self) -> list[str]:
+        cfg = self.seg["tissue"]["cfg"]
+        return cfg.get("classes") or TISSUE_CLASSES[:cfg["num_classes"]]  # older checkpoints had 6 classes
+
+    def _tissue_map(self, img: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Tissue class and confidence per pixel, on the crop the tissue model was trained on (if it was)."""
+        cfg = self.seg["tissue"]["cfg"]
+        box = wound_box(mask, cfg["crop_margin"]) if cfg.get("crop_margin") else None
+        if box is None:
+            return self._segment(img, "tissue", with_confidence=True)
+        tissue, conf = np.zeros(mask.shape, np.uint8), np.zeros(mask.shape, np.float32)
+        tissue[box], conf[box] = self._segment(img[box], "tissue", with_confidence=True)
+        return tissue, conf
+
+    def _tissue(self, img: np.ndarray, mask: np.ndarray) -> dict:
+        """Tissue mix of the wound bed and of the skin around it.
+
+        A cross-validated checkpoint lists the classes it may be trusted on (scripts/tissue_cv.py). Others are left
+        out of every share, layer and rule, and only named for the clinician to check if they cover a fair area."""
+        classes = self.tissue_classes()
+        tissue, conf = self._tissue_map(img, mask)
+        bed, out = mask > 0, {}
+        trusted = self.seg["tissue"]["cfg"].get("trusted_classes")
+        if trusted is not None:
+            ring_or_bed = (cv2.dilate(mask, np.ones((25, 25), np.uint8)) > 0)
+            seen = [c for k, c in enumerate(classes) if k and c not in trusted
+                    and (tissue[ring_or_bed] == k).mean() >= UNTRUSTED_MENTION_FRAC]
+            if seen:
+                out["tissue_untrusted"] = seen
+        idx = {c: i for i, c in enumerate(classes) if trusted is None or c in trusted}
+        counts = {c: int((tissue[bed] == idx[c]).sum()) for c in WOUND_BED if c in idx}
+        total = sum(counts.values())
+        out["tissue_confidence"] = round(float(conf[bed].mean()), 2)
+        if total:
+            pct = {c: round(100 * n / total) for c, n in counts.items() if n}
+            # An unsure estimate is shown to the clinician but never feeds the healing or care rules.
+            out["tissue_pct" if out["tissue_confidence"] >= TISSUE_MIN_CONFIDENCE else "tissue_pct_uncertain"] = pct
+        ring = (cv2.dilate(mask, np.ones((25, 25), np.uint8)) - mask) > 0
+        if ring.any():
+            for c, key in (("periwound_erythema", "periwound_erythema_frac"), ("maceration", "periwound_maceration_frac"),
+                           ("callus", "periwound_callus_frac")):
+                if c in idx:
+                    out[key] = round(float((tissue[ring] == idx[c]).mean()), 2)
+        outline = {}
+        for c in WOUND_BED + PERIWOUND:
+            if c in idx and (poly := mask_outline(((tissue == idx[c]) & (bed if c in WOUND_BED else ring)).astype(np.uint8))):
+                outline[c] = poly
+        out["tissue_outline"] = outline or None
+        return out
 
     @torch.no_grad()
     def _classify(self, crop: np.ndarray, name: str, intake: dict, return_probs: bool = False):
@@ -142,10 +233,11 @@ class WoundAnalyzer:
         calib = find_marker(img, self.marker_mm)
         q = check_quality(img)
         f = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="minutes"), "intake": intake,
-             "quality": {"ok": q.ok, "issues": q.issues, **q.metrics}, "marker_found": calib is not None,
+             "quality": {"ok": q.ok, "usable": q.usable, "issues": q.issues, "warnings": q.warnings, **q.metrics},
+             "marker_found": calib is not None,
              "model_versions": {**{k: v["version"] for k, v in self.seg.items()},
                                 **{k: v["version"] for k, v in self.cls.items()}}}
-        if not q.ok:  # blurry / dark / glare: do not analyse, ask for a retake
+        if not q.usable:  # blank, tiny, all black or white: nothing to analyse, ask for a retake
             f["status"] = "retake"
             return f
 
@@ -168,16 +260,11 @@ class WoundAnalyzer:
                 f["severity"][head] = self._classify(img, head, intake)
 
         if "tissue" in self.seg and mask is not None:
-            tissue = self._segment(img, "tissue")
-            bed = tissue[mask > 0]
-            counts = {c: int((bed == TISSUE_CLASSES.index(c)).sum()) for c in WOUND_BED}
-            total = sum(counts.values())
-            if total:
-                f["tissue_pct"] = {c: round(100 * n / total) for c, n in counts.items() if n}
-            ring = cv2.dilate(mask, np.ones((25, 25), np.uint8)) - mask
-            if ring.sum():
-                ery = (tissue[ring > 0] == TISSUE_CLASSES.index("periwound_erythema")).mean()
-                f["periwound_erythema_frac"] = round(float(ery), 2)
+            # Tissue is judged by colour, so correct the lighting's colour cast from the sticker's grey patch.
+            gains = grey_patch_gains(img, calib, self.marker_mm) if calib is not None else None
+            f["white_balance"] = gains
+            balanced = img if gains is None else np.clip(img * np.array(gains, np.float32), 0, 255).astype(np.uint8)
+            f.update(self._tissue(balanced, mask))
 
         f["outline"] = mask_outline(mask)
         f["measurement"] = None
@@ -198,9 +285,6 @@ class WoundAnalyzer:
         f["report_markdown"], f["llm_problems"] = build_report(f, llm_text)
         f["status"] = "ok"
 
-        if overlay_path and mask is not None:
-            vis = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(vis, cnts, -1, (0, 255, 0), max(2, img.shape[1] // 300))
-            cv2.imwrite(overlay_path, vis)
+        if overlay_path and f["outline"]:
+            cv2.imwrite(overlay_path, cv2.cvtColor(draw_overlay(img, f, tissue=True), cv2.COLOR_RGB2BGR))
         return f

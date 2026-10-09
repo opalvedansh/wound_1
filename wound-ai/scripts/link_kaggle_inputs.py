@@ -6,6 +6,8 @@ Datasets attached to the Kaggle notebook as inputs are linked; any that aren't a
 
     python scripts/link_kaggle_inputs.py                 # on Kaggle
     python scripts/link_kaggle_inputs.py --input-root X  # anywhere else
+    python scripts/link_kaggle_inputs.py --set tissue    # the tissue dataset, into data/raw/tissue/
+    python scripts/link_kaggle_inputs.py --set pool      # extra unlabelled wound photos, into data/raw/pool/
 
 The datasets:
 """
@@ -25,7 +27,19 @@ DATASETS = {
     "shubhambaid/skin-burn-dataset": "shubhambaid_skin-burn-dataset",
     "leoscode/wound-segmentation-images": "leoscode_wound-segmentation-images",
 }
-__doc__ += "".join(f"\n    {ref}" for ref in DATASETS)
+# Tissue-labelled data (build_tissue_dataset.py); WoundTissue and LUTSeg come from GitHub and Hugging Face instead.
+TISSUE_DATASETS = {"ibrahimshehada/dfutissue": "dfutissue"}
+# Extra photos for the tissue model's unlabelled pool only (pseudo-labels; never trained on with their own labels, never
+# tested on). Not CO2Wounds: LUTSeg's photos come from it, so it would hold the locked test patients' other visits.
+POOL_DATASETS = {
+    "pabodhamallawa/dfuc2022-train-release": "pabodhamallawa_dfuc2022-train-release",  # DFUC2022 train, 2000 DFU
+    "tushartalukder4/dfuc-c5": "tushartalukder4_dfuc-c5",  # DFUC2022 test images, 2000 DFU
+    "abdulazizalghaili/postoperative-wound-infection": "abdulazizalghaili_postoperative-wound-infection",  # 380 surgical
+    "mohamadtaher/wound-data": "mohamadtaher_wound-data",  # FUSeg incl. its 200 challenge-test photos
+}
+SETS = {"public": (DATASETS, "data/raw/public"), "tissue": (TISSUE_DATASETS, "data/raw/tissue"),
+        "pool": (POOL_DATASETS, "data/raw/pool")}
+__doc__ += "".join(f"\n    {ref}" for ref in [*DATASETS, *TISSUE_DATASETS, *POOL_DATASETS])
 
 
 def find(root: Path, ref: str) -> Path | None:
@@ -57,13 +71,15 @@ def download(ref: str) -> Path | None:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input-root", default="/kaggle/input")
-    ap.add_argument("--out", default="data/raw/public")
+    ap.add_argument("--set", choices=list(SETS), default="public")
+    ap.add_argument("--out", default="", help="default: data/raw/<set>")
     ap.add_argument("--no-download", action="store_true", help="only link attached inputs, never download")
     a = ap.parse_args()
-    root, out = Path(a.input_root), Path(a.out)
+    datasets, default_out = SETS[a.set]
+    root, out = Path(a.input_root), Path(a.out or default_out)
     out.mkdir(parents=True, exist_ok=True)
     missing = []
-    for ref, local in DATASETS.items():
+    for ref, local in datasets.items():
         src, dst = find(root, ref), out / local
         if src is None and not a.no_download:
             src = download(ref)
@@ -81,7 +97,7 @@ def main():
                  "then Save Version -> Save & Run All again. Missing:\n  " + "\n  ".join(missing))
     if missing:
         sys.exit("Couldn't get (is Internet on in Session options?):\n  " + "\n  ".join(missing))
-    print(f"all {len(DATASETS)} datasets linked")
+    print(f"all {len(datasets)} datasets linked")
 
 
 if __name__ == "__main__":

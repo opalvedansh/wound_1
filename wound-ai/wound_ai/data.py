@@ -26,8 +26,21 @@ from albumentations.pytorch import ToTensorV2
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Tissue classes used in the tissue-segmentation masks (pixel value = class index).
-TISSUE_CLASSES = ["background", "granulation", "slough", "necrosis", "epithelial", "periwound_erythema"]
+# Tissue classes used in the tissue-segmentation masks (pixel value = class index). Wound bed: granulation to
+# epithelial, plus exposed bone or tendon (a review flag). Around the wound: redness and macerated (soggy) skin.
+# Callus (thick hard skin around a diabetic foot ulcer) is last so earlier indices never move.
+TISSUE_CLASSES = ["background", "granulation", "slough", "necrosis", "epithelial", "periwound_erythema",
+                  "maceration", "exposed_structure", "callus"]
+WOUND_BED = ["granulation", "slough", "necrosis", "epithelial", "exposed_structure"]
+PERIWOUND = ["periwound_erythema", "maceration", "callus"]
+# Tissue mask pixels with this value are not learned from: an annotator was unsure, or a public dataset's class
+# (such as dressing) has no place in TISSUE_CLASSES.
+IGNORE_INDEX = 255
+# Manifest column naming the tissue classes a row's dataset annotates, ";"-separated (all classes if empty). Public
+# datasets label different subsets: a pixel one of them calls background may be a class it never labels.
+# Tissue is fine detail, so the tissue model sees the wound's box plus a margin of skin, not the whole photo.
+# Training varies the margin, as the predicted outline the app crops with will be a little off.
+TISSUE_CROP_MARGIN = (0.10, 0.25)
 
 
 # --------------------------------------------------------------------------- transforms
@@ -80,13 +93,18 @@ def read_mask(path: str, binary: bool) -> np.ndarray:
 # --------------------------------------------------------------------------- datasets
 
 class SegmentationDataset(Dataset):
-    """Wound boundary (binary) or tissue (multi-class) segmentation."""
+    """Wound boundary (binary) or tissue (multi-class) segmentation.
 
-    def __init__(self, df: pd.DataFrame, size: int, train: bool, mask_col: str = "mask_path", binary: bool = True):
+    crop=True (tissue): photo and mask are cut to the wound's box plus a margin, as the app does with its predicted
+    outline. The box comes from the boundary mask if the row has one, else from the tissue mask's wound bed."""
+
+    def __init__(self, df: pd.DataFrame, size: int, train: bool, mask_col: str = "mask_path", binary: bool = True,
+                 crop: bool = False):
         self.df = df[df[mask_col].fillna("").astype(str).str.len() > 0].reset_index(drop=True)
         self.tf = build_transforms(size, train)
         self.mask_col = mask_col
         self.binary = binary
+        self.crop, self.train = crop, train
 
     def __len__(self) -> int:
         return len(self.df)
@@ -97,23 +115,50 @@ class SegmentationDataset(Dataset):
         mask = read_mask(row[self.mask_col], self.binary)
         if mask.shape[:2] != img.shape[:2]:
             mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        if self.crop:
+            lo, hi = TISSUE_CROP_MARGIN
+            margin = float(np.random.uniform(lo, hi)) if self.train else (lo + hi) / 2
+            bp = str(row.get("mask_path", "") or "")
+            wound = read_mask(bp, binary=True) if bp and bp != "nan" else np.isin(
+                mask, [TISSUE_CLASSES.index(c) for c in WOUND_BED]).astype(np.uint8)
+            if wound.shape[:2] != img.shape[:2]:
+                wound = cv2.resize(wound, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+            box = wound_box(wound, margin)
+            if box is not None:
+                img, mask = img[box], mask[box]
         out = self.tf(image=img, mask=mask)
         mask_t = out["mask"].long()
         if self.binary:
-            mask_t = mask_t.float().unsqueeze(0)
-        return out["image"], mask_t
+            return out["image"], mask_t.float().unsqueeze(0)
+        return out["image"], mask_t, annotated_classes(row.get("tissue_classes"))
+
+
+def annotated_classes(value) -> torch.Tensor:
+    """Which TISSUE_CLASSES a row's dataset labels (bool per class; background always). Empty: all of them."""
+    names = [n.strip() for n in str(value or "").split(";") if n.strip() and str(value) != "nan"]
+    if not names:
+        return torch.ones(len(TISSUE_CLASSES), dtype=torch.bool)
+    unknown = set(names) - set(TISSUE_CLASSES)
+    if unknown:
+        raise ValueError(f"unknown tissue classes in tissue_classes: {sorted(unknown)}")
+    return torch.tensor([c == "background" or c in names for c in TISSUE_CLASSES])
+
+
+def wound_box(mask: np.ndarray | None, margin: float) -> tuple[slice, slice] | None:
+    """The wound's bounding box plus `margin` of its size on each side, clipped to the photo; None if no wound."""
+    if mask is None or not mask.any():
+        return None
+    ys, xs = np.where(mask > 0)
+    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
+    py, px = int((y1 - y0 + 1) * margin), int((x1 - x0 + 1) * margin)
+    H, W = mask.shape[:2]
+    return slice(max(0, y0 - py), min(H, y1 + py + 1)), slice(max(0, x0 - px), min(W, x1 + px + 1))
 
 
 def crop_to_wound(img: np.ndarray, mask: np.ndarray | None, margin: float = 0.35) -> np.ndarray:
     """Crop around the wound plus a margin of surrounding skin (periwound matters clinically)."""
-    if mask is None or mask.sum() == 0:
-        return img
-    ys, xs = np.where(mask > 0)
-    y0, y1, x0, x1 = ys.min(), ys.max(), xs.min(), xs.max()
-    h, w = y1 - y0 + 1, x1 - x0 + 1
-    py, px = int(h * margin), int(w * margin)
-    H, W = img.shape[:2]
-    return img[max(0, y0 - py): min(H, y1 + py + 1), max(0, x0 - px): min(W, x1 + px + 1)]
+    box = wound_box(mask, margin)
+    return img if box is None else img[box]
 
 
 class MetaEncoder:

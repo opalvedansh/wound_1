@@ -80,3 +80,39 @@ def cohen_kappa(a: np.ndarray, b: np.ndarray) -> float:
     from sklearn.metrics import cohen_kappa_score
 
     return float(cohen_kappa_score(a, b))
+
+
+def repeatability(groups: list[list[float]], log: bool = True, n_boot: int = 1000, seed: int = 0) -> dict | None:
+    """Test-retest repeatability from repeated measurements of the same wound (one list per wound, 2+ values,
+    e.g. the area each photographer's photo gave in the same visit).
+
+    Within-wound SD (Sw, pooled over wounds) -> repeatability coefficient RC = 1.96 * sqrt(2) * Sw: two measurements
+    of an unchanged wound differ by less than RC 95% of the time, so a smaller change is noise. Areas are compared
+    on the log scale (error grows with wound size), giving percentages; tissue shares on the raw scale (points).
+    Returns {"n_wounds", "n_measurements", "sw", "rc", ...} with a bootstrap 95% CI on RC (resampling wounds);
+    for log=True also the change, in percent, that is beyond noise for a wound getting smaller or larger.
+    """
+    vals = [np.log(np.asarray(g, float)) if log else np.asarray(g, float) for g in groups if len(g) >= 2]
+    if log:
+        vals = [v for v in vals if np.isfinite(v).all()]
+    if len(vals) < 2:
+        return None
+
+    def rc_of(sample: list[np.ndarray]) -> float:
+        ss = sum(((v - v.mean()) ** 2).sum() for v in sample)
+        df = sum(len(v) - 1 for v in sample)
+        return 1.96 * np.sqrt(2) * np.sqrt(ss / df)
+
+    rc = rc_of(vals)
+    rng = np.random.default_rng(seed)
+    boot = [rc_of([vals[i] for i in rng.integers(0, len(vals), len(vals))]) for _ in range(n_boot)]
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    out = {"n_wounds": len(vals), "n_measurements": int(sum(len(v) for v in vals)),
+           "sw": round(float(rc / (1.96 * np.sqrt(2))), 4), "rc": round(float(rc), 4),
+           "rc_ci95": [round(float(lo), 4), round(float(hi), 4)]}
+    if log:
+        # A change is beyond noise when the new/old area ratio leaves [exp(-RC), exp(RC)].
+        out["smaller_pct"] = round(float(100 * (1 - np.exp(-rc))), 1)
+        out["larger_pct"] = round(float(100 * (np.exp(rc) - 1)), 1)
+        out["larger_pct_ci95_upper"] = round(float(100 * (np.exp(hi) - 1)), 1)
+    return out

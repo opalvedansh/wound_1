@@ -111,3 +111,44 @@ def area_change(current_cm2: float, previous_cm2: float, days: float | None = No
     if days:
         out["days_between"] = days
     return out
+
+
+# The printed sheet (scripts/make_marker.py) puts a neutral grey square of the marker's size this far to the
+# right of each marker, on the same sticker.
+GREY_GAP_MM = 4.0  # about one marker module of white, so detection still sees the marker's edge
+
+
+def _plane_mean(img_rgb: np.ndarray, calib: Calibration, x0: float, x1: float, y0: float, y1: float):
+    """Mean and spread of the pixels covering a rectangle (mm, marker plane); None if it leaves the photo."""
+    corners_mm = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32).reshape(-1, 1, 2)
+    corners = cv2.perspectiveTransform(corners_mm, np.linalg.inv(calib.homography)).reshape(-1, 2)
+    h, w = img_rgb.shape[:2]
+    if (corners < 0).any() or (corners[:, 0] >= w).any() or (corners[:, 1] >= h).any():
+        return None
+    region = np.zeros((h, w), np.uint8)
+    cv2.fillConvexPoly(region, corners.round().astype(np.int32), 1)
+    px = img_rgb[region > 0].astype(np.float32)
+    return (px.mean(0), px.std(0)) if len(px) >= 20 else None
+
+
+def grey_patch_gains(img_rgb: np.ndarray, calib: Calibration, marker_mm: float = 20.0) -> list[float] | None:
+    """Per-channel gains that make the sticker's grey patch neutral, i.e. undo the lighting's colour cast.
+
+    Tissue is judged by colour (red granulation, yellow slough, black necrosis), so a warm lamp or a phone's white
+    balance shifts the tissue mix. The white gap between marker and patch is lit by the same light, so a real patch
+    is about half as bright as the gap in every channel whatever the cast; skin or bare paper is not. Returns None
+    when the patch is missing (older sticker sheets), out of the photo, uneven, or too dark or bright to trust.
+    """
+    inset = 0.2 * marker_mm
+    patch = _plane_mean(img_rgb, calib, marker_mm + GREY_GAP_MM + inset, 2 * marker_mm + GREY_GAP_MM - inset,
+                        inset, marker_mm - inset)
+    gap = _plane_mean(img_rgb, calib, marker_mm + 0.3 * GREY_GAP_MM, marker_mm + 0.7 * GREY_GAP_MM,
+                      inset, marker_mm - inset)
+    if patch is None or gap is None:
+        return None
+    (mean, std), (white, _) = patch, gap
+    ratio = mean / np.maximum(white, 1)
+    if std.max() > 12 or not 40 <= mean.mean() <= 220 or not ((0.3 <= ratio) & (ratio <= 0.7)).all() \
+            or ratio.max() / ratio.min() > 1.3:  # not 1.0: bright paper clips in the strongest channel
+        return None
+    return [round(float(np.clip(mean.mean() / m, 0.6, 1.6)), 3) for m in mean]

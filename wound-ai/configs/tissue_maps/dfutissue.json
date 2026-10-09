@@ -1,0 +1,11 @@
+{
+  "source": "dfutissue",
+  "_note": "DFUTissue (Dhar et al. 2024; Kaggle ibrahimshehada/dfutissue). Labeled/Original/Annotations are single-channel 0-3; Palette/palette_colorCode.txt: Red (1) Fibrin, Green (2) Granulation, Blue (3) Callus. Fibrin is slough. Only these three of the paper's eight tissue types are in the public release.",
+  "values": {
+    "0": "background",
+    "1": "slough",
+    "2": "granulation",
+    "3": "callus"
+  },
+  "unlisted": "ignore"
+}

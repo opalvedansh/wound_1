@@ -1,0 +1,15 @@
+{
+  "source": "example",
+  "_note": "Template only: replace every code with the one in your dataset's documentation. Values: background, granulation, slough, necrosis, epithelial, periwound_erythema, maceration, exposed_structure, or ignore.",
+  "values": {
+    "0": "background",
+    "1": "granulation",
+    "2": "slough",
+    "3": "necrosis",
+    "4": "epithelial",
+    "5": "exposed_structure",
+    "6": "maceration",
+    "7": "ignore"
+  },
+  "unlisted": "ignore"
+}

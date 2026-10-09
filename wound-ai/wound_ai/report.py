@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 
 from .intake import FOOT_SITES, LEG_AND_FOOT_SITES, SPECIAL_BURN_SITES
+from .progress import FOUR_WEEK_TARGET, FOUR_WEEK_WINDOW, progress_flags, trajectory, within_noise
 
 DISCLAIMER = ("AI-generated draft for review by a qualified clinician. It is not a diagnosis and must not be used "
               "to start, stop or change treatment without clinical assessment.")
@@ -24,6 +25,8 @@ DISCLAIMER = ("AI-generated draft for review by a qualified clinician. It is not
 UNCERTAIN_BELOW = 0.70  # calibrated probability below which a classification is reported as uncertain
 ABPI_LOW = 0.8  # below: arterial or mixed disease possible (guidelines differ; clinician sets the threshold)
 ABPI_HIGH = 1.3  # above: arteries may be calcified, so the reading can be falsely reassuring
+# Quality warnings (quality.py) as the flag names them.
+QUALITY_WORDS = {"low_resolution": "low resolution", "blurry": "blurry", "dark": "dark", "glare": "glare"}
 # Prefix of every danger-sign flag (Chart 1): the report then opens with "Emergency care now".
 DANGER = "Danger sign"
 
@@ -86,15 +89,24 @@ def red_flags(f: dict) -> list[dict]:
     if a.get("wound_opening") == "yes":
         add("review", "Surgical wound reported as opening: contact the operating team.")
     pct = chg.get("percent_area_reduction")
-    if pct is not None and pct < 0:
-        add("review", "Wound area has increased since the last photo.")
-    if pct is not None and chg.get("days_between", 0) >= 28 and pct < 50 and wt in ("diabetic", "venous"):
-        add("review", "Less than half the area has closed over about 4 weeks: review the care plan.")
+    if pct is not None:  # the single-previous-photo comparison of /analyze; same rules as the treatment report
+        heal = {"basis": "area", "trajectory": trajectory({"percent_area_reduction": pct})[0]}
+        target = FOUR_WEEK_TARGET.get(wt or "")
+        if target and chg.get("days_between", 0) >= FOUR_WEEK_WINDOW[0]:
+            heal["four_week"] = {"target": target, "on_track": pct >= target}
+        flags += progress_flags(heal, wt)
+    if t.get("exposed_structure"):
+        add("review", "Possible exposed bone or tendon in the wound bed: confirm on examination (risk of bone "
+                      "infection).")
     conf = (f.get("wound_type") or {}).get("prob")
     if conf is not None and conf < UNCERTAIN_BELOW:
         add("review", "Model is uncertain about the wound type: clinician to classify.")
     if f.get("measurement") is None:
         add("review", "Size not measured (calibration sticker not detected or no wound region found).")
+    warned = [QUALITY_WORDS[w] for w in (f.get("quality") or {}).get("warnings", []) if w in QUALITY_WORDS]
+    if warned:
+        add("review", f"Photo quality ({', '.join(warned)}): the outline, size and tissue estimates may be less "
+                      "accurate. Check them against the photo.")
     return flags
 
 
@@ -147,7 +159,8 @@ def template_narrative(f: dict) -> str:
     c = f.get("change") or {}
     if "percent_area_reduction" in c:
         verb = "decreased" if c["percent_area_reduction"] >= 0 else "increased"
-        parts.append(f"Area has {verb} by {abs(c['percent_area_reduction'])}% since the previous photo.")
+        noise = " (within measurement noise)" if within_noise(c["percent_area_reduction"]) else ""
+        parts.append(f"Area has {verb} by {abs(c['percent_area_reduction'])}% since the previous photo{noise}.")
     return " ".join(parts)
 
 
@@ -183,6 +196,12 @@ def render_report(f: dict, narrative: str | None = None) -> str:
         lines.append("- Size: not measured.")
     if t:
         lines.append("- Wound bed tissue: " + ", ".join(f"{k} {v}%" for k, v in t.items()))
+    if f.get("tissue_untrusted"):
+        lines.append("- Possibly also: " + ", ".join(x.replace("_", " ") for x in f["tissue_untrusted"])
+                     + " (the tissue model is not yet reliable for these: check on examination).")
+    if not t and f.get("tissue_pct_uncertain"):
+        lines.append(f"- Wound bed tissue: UNCERTAIN (model confidence {f['tissue_confidence']:.0%}; estimate "
+                     + ", ".join(f"{k} {v}%" for k, v in f["tissue_pct_uncertain"].items()) + "). Assess on examination.")
     if f.get("change"):
         c = f["change"]
         lines.append(f"- Change: previous area {c.get('previous_area_cm2')} cm², "
@@ -258,3 +277,122 @@ def build_report(f: dict, llm_text: str | None = None) -> tuple[str, list[str]]:
     problems = check_narrative(llm_text, f) if llm_text else []
     narrative = llm_text.strip() if llm_text and not problems else None
     return render_report(f, narrative), problems
+
+
+# --------------------------------------------------------------------------- treatment report
+
+TRAJECTORY_TEXT = {"improving": "Improving", "static": "Static, change within measurement noise",
+                   "deteriorating": "Deteriorating"}
+
+
+def _change_line(label: str, c: dict | None) -> str | None:
+    if not c:
+        return None
+    parts = []
+    if "percent_area_reduction" in c:
+        verb = "smaller" if c["percent_area_reduction"] >= 0 else "larger"
+        parts.append(f"area {c['area_before_cm2']} → {c['area_after_cm2']} cm² "
+                     f"({abs(c['percent_area_reduction'])}% {verb})")
+        if "cm2_per_week" in c:
+            parts.append(f"{c['cm2_per_week']} cm²/week")
+        if "edge_advance_cm_per_week" in c:
+            parts.append(f"edge advance {c['edge_advance_cm_per_week']} cm/week")
+    if "nonviable_before_pct" in c:
+        parts.append(f"non-viable tissue {c['nonviable_before_pct']}% → {c['nonviable_after_pct']}%")
+    if not parts:
+        return None
+    days = f" ({c['days']:g} days)" if c.get("days") else ""
+    return f"- {label}{days}: " + "; ".join(parts)
+
+
+def treatment_narrative(prog: dict, care: dict) -> str:
+    parts = []
+    h = prog.get("healing") or {}
+    if h.get("trajectory"):
+        basis = "wound area" if h["basis"] == "area" else "the tissue mix (no size: sticker missing)"
+        parts.append(f"Since the last visit the wound is {h['trajectory']}, judged by {basis}.")
+    elif h:
+        parts.append(f"Healing not compared: {h.get('reason', 'not enough photos')}.")
+    s = prog.get("session") or {}
+    if "nonviable_removed_points" in s:
+        parts.append(f"This session reduced non-viable tissue from {s['nonviable_before_pct']}% to "
+                     f"{s['nonviable_after_pct']}%.")
+    if care.get("suggestions"):
+        parts.append("Suggested considerations: " + ", ".join(x["action"] for x in care["suggestions"]) + ".")
+    return " ".join(parts)
+
+
+def render_treatment_report(req: dict, prog: dict, care: dict, flags: list[dict], narrative: str | None = None) -> str:
+    """The treatment's draft: the PRE photo's findings, what the session did, healing since earlier visits,
+    and the care suggestions. Numbers and suggestions come from progress.py and care.py, never from the LLM."""
+    treatments = req.get("treatments") or [{}]
+    cur = treatments[-1]
+    seq = cur.get("sequence") or len(treatments)
+    lines = [f"# Treatment {seq} assessment (AI-assisted draft)", f"_{DISCLAIMER}_", ""]
+    if has_danger_signs(flags):
+        lines += ["**Emergency care now: do not wait for this report.** Danger signs are listed under Flags.", ""]
+    lines.append("## Flags")
+    lines += [f"- **{fl['level'].upper()}**: {fl['text']}" for fl in flags] or ["- None raised by the automatic rules."]
+    lines += ["", "## Summary", narrative or treatment_narrative(prog, care), "",
+              "## Findings", f"- Wound type: {_fmt_class(req.get('wound_type'))}"]
+    for k, v in (req.get("severity") or {}).items():
+        lines.append(f"- {k.replace('_', ' ').capitalize()}: {_fmt_class(v)}")
+    for name, obs in (("Before treatment", cur.get("pre")), ("After cleaning", cur.get("post"))):
+        if not obs:
+            continue
+        if obs.get("status") != "ok":
+            lines.append(f"- {name}: photo not analysable ({obs.get('status')}).")
+            continue
+        size = f"area {obs['area_cm2']} cm², {obs['length_cm']} x {obs['width_cm']} cm" if obs.get("area_cm2") \
+            else "size not measured (no sticker)"
+        t = obs.get("tissue_pct")
+        tissue = ("; tissue " + ", ".join(f"{k} {v}%" for k, v in t.items())) if t else ""
+        lines.append(f"- {name}: {size}{tissue}")
+
+    s = prog.get("session")
+    if s:
+        lines += ["", "## This visit (before → after cleaning)"]
+        if "area_before_cm2" in s:
+            note = f", {s['area_note']}" if s.get("area_note") else ""
+            lines.append(f"- Area {s['area_before_cm2']} → {s['area_after_cm2']} cm²{note}")
+        if "nonviable_removed_points" in s:
+            lines.append(f"- Non-viable tissue {s['nonviable_before_pct']}% → {s['nonviable_after_pct']}%")
+
+    h = prog.get("healing") or {}
+    lines += ["", "## Healing"]
+    if h.get("trajectory"):
+        which = "after-cleaning" if h["phase"] == "post" else "before-treatment"
+        lines.append(f"- Trajectory: {TRAJECTORY_TEXT[h['trajectory']]} (by {h['basis']}, comparing {which} photos)")
+        nb = h.get("noise_band")
+        if nb:
+            lines.append(f"- Noise band: {nb['smaller_pct']:g}% smaller to {nb['larger_pct']:g}% larger counts as no "
+                         f"change ({nb['source']})")
+        lines += [x for x in (_change_line("Since last visit", h.get("since_last")),
+                              _change_line("Since first visit", h.get("since_first"))) if x]
+        fw = h.get("four_week")
+        if fw:
+            state = "on track" if fw["on_track"] else "NOT on track"
+            lines.append(f"- 4-week check: {fw['percent_area_reduction']}% smaller at day {fw['days']:g} "
+                         f"(target {fw['target']:.0f}%): {state}")
+    else:
+        lines.append(f"- Not compared: {h.get('reason', 'not enough photos')}.")
+    p = prog.get("push")
+    if p:
+        lines.append(f"- PUSH score {p['score']}/17 (size {p['size']}, exudate {p['exudate']}, tissue {p['tissue']}; "
+                     f"{p['note']})")
+
+    lines += ["", "## For the clinician to consider"]
+    for c in care.get("checks", []):
+        lines.append(f"- **Check**: {c['text']}")
+    for c in care.get("contraindications", []):
+        lines.append(f"- **Avoid {c['action']}**: {c['reason']}.")
+    for sg in care.get("suggestions", []):
+        alt = f" (or {', '.join(sg['alternatives'])})" if sg["alternatives"] else ""
+        lines.append(f"- **{sg['action']}**{alt}: {sg['text']} Because: {'; '.join(sg['because'])}.")
+    if not any(care.get(k) for k in ("checks", "contraindications", "suggestions")):
+        lines.append("- No rule-based suggestions.")
+    lines += ["", "## For the reviewing clinician",
+              "- Suggestions come from placeholder rules awaiting clinical sign-off; accept or decline each one.",
+              "- Assess depth, undermining, pulses/perfusion and infection signs, which a photo cannot show.",
+              "", f"Rules version: {care.get('rules_version')}"]
+    return "\n".join(lines)

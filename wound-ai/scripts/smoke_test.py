@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from wound_ai.measure import ARUCO_DICT, find_marker, measure_wound
+from wound_ai.measure import ARUCO_DICT, GREY_GAP_MM, find_marker, grey_patch_gains, measure_wound
 
 PX_PER_MM = 4.0
 MARKER_MM = 20.0
@@ -61,6 +61,16 @@ def test_measurement() -> None:
     # corner errors are extrapolated. Real photos (marker 200+ px, placed right next to the
     # wound) do better; validate on your own data against clinician tracings.
     assert abs(m2.area_cm2 - 6.0) / 6.0 < 0.05, "perspective correction off by more than 5%"
+
+    # The grey patch beside the marker, photographed under a warm light: the gains must undo the cast.
+    warm = img.copy()
+    side, gap = int(MARKER_MM * PX_PER_MM), int(GREY_GAP_MM * PX_PER_MM)
+    warm[60:60 + side, 60 + side + gap:60 + 2 * side + gap] = 128
+    warm = np.clip(warm * np.array([1.15, 1.0, 0.85]), 0, 255).astype(np.uint8)
+    gains = grey_patch_gains(warm, find_marker(warm, MARKER_MM), MARKER_MM)
+    print("white balance gains:", gains)
+    assert gains and abs(gains[0] * 1.15 - gains[2] * 0.85) < 0.03, "grey patch should neutralise the cast"
+    assert grey_patch_gains(img, cal, MARKER_MM) is None, "no patch (old sticker sheet): no correction"
 
 
 def make_synthetic(root: Path, n_patients: int = 24, per_patient: int = 2) -> Path:
@@ -122,13 +132,21 @@ def main():
         run("scripts/train_seg.py", *common, "--task", "boundary", "--arch", "unet", "--encoder", "resnet18",
             "--out", str(work / "runs/boundary"))
         run("scripts/train_seg.py", *common, "--task", "tissue", "--arch", "segformer", "--encoder", "mit_b0",
-            "--out", str(work / "runs/tissue"))
+            "--crop", "--class-weights", "0.5,1,1,1,1,1,1,1", "--out", str(work / "runs/tissue"))
         run("scripts/train_cls.py", *common, "--target", "wound_type", "--backbone", "resnet18",
             "--meta-cols", "body_location", "--out", str(work / "runs/wound_type"))
         for src in ("runs/boundary/boundary.pt", "runs/tissue/tissue.pt", "runs/wound_type/wound_type.pt"):
             shutil.copy(work / src, ck)
         run("scripts/evaluate.py", "--manifest", man, "--ckpt-dir", str(ck), "--group-cols", "fitzpatrick",
             "--out", str(work / "eval.json"))
+
+        # Tissue: teacher -> pseudo-labels -> student, cross-validated, as the Kaggle tissue notebook runs it.
+        unl = work / "unlabeled.csv"
+        pd.DataFrame({"image_path": sorted(str(p) for p in (d / "img").iterdir())[:12]}).to_csv(unl, index=False)
+        run("scripts/tissue_cv.py", "--manifest", man, "--unlabeled", str(unl), "--boundary", str(ck / "boundary.pt"),
+            "--arch", "unet", "--encoder", "resnet18", "--size", "128", "--batch", "4", "--workers", "0",
+            "--folds", "2", "--smoke", "--min-test-photos", "1", "--out", str(work / "tissue_cv"))
+        assert (work / "tissue_cv/best/tissue.pt").exists() and (work / "tissue_cv/summary.md").exists()
 
         from wound_ai.pipeline import WoundAnalyzer
 
@@ -172,6 +190,27 @@ def main():
         assert r.status_code == 200, r.text
         print("API /analyze status:", r.json()["status"], "| follow-ups:",
               [q["id"] for q in r.json().get("follow_up_questions", [])])
+
+        # Three visits of one wound, PRE and POST each, through the treatment report.
+        from wound_ai.progress import observation
+
+        treatments = []
+        for seq, name in enumerate(("p01_0.png", "p01_1.png", "p02_0.png"), start=1):
+            obs = {}
+            for phase in ("pre", "post"):
+                with open(d / "img" / name, "rb") as fh:
+                    fa = c.post("/analyze", files={"image": ("w.png", fh, "image/png")},
+                                data={"intake": json.dumps({"diabetes": "no", "cause": "started_on_its_own",
+                                                            "body_location": "lower_leg"}), "phase": phase}).json()
+                obs[phase] = observation(fa, f"2026-01-{1 + 14 * (seq - 1):02d}T10:00:00+00:00")
+            treatments.append({"sequence": seq, **obs, "assessment": {"exudate_level": "Moderate"}, "dressing": "Foam"})
+        r = c.post("/treatment-report", json={"wound_type": fa.get("wound_type"), "intake": {"body_location": "lower_leg"},
+                                              "treatments": treatments})
+        assert r.status_code == 200, r.text
+        tr = r.json()
+        print("treatment report: healing", tr["progress"]["healing"].get("trajectory"),
+              "| suggestions", [x["action"] for x in tr["suggestions"]])
+        assert "# Treatment 3 assessment" in tr["report_markdown"]
         print("\nSMOKE TEST PASSED")
     finally:
         shutil.rmtree(work, ignore_errors=True)

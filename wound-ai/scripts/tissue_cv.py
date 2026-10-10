@@ -139,6 +139,8 @@ def projected_hours(a, folds: int, gpus: int, weights: list[float], n_pool: int,
     if a.teacher_only:
         student = label = 0
     hours = math.ceil(folds / max(1, gpus)) * (teacher + label + student) / 3600
+    if a.final_fit:  # one more teacher, on about a fifth more photos than a fold trains on
+        hours += 1.2 * teacher / 3600
     print(f"timing: {per_batch:.2f} s per batch at {a.size}px; {folds} folds on {max(1, gpus)} GPU(s) -> about "
           f"{hours:.1f} h (worst case: all epochs, no early stop)", flush=True)
     return hours

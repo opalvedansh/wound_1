@@ -128,13 +128,14 @@ def projected_hours(a, folds: int, gpus: int, out: Path) -> float:
     b_train, b_val = math.ceil(n_train / a.seg_batch), math.ceil(n_val / a.seg_batch)
     # A validation batch costs about a third of a training batch (no backward pass).
     per_epoch = secs[0] * (b_train + b_val / 3) / (min(20, b_train) + min(20, b_val) / 3)
-    rounds = math.ceil(folds / max(1, gpus))
+    # The final fit is one more round, on about a fifth more photos than a fold trains on.
+    rounds = math.ceil(folds / max(1, gpus)) + (1.2 if a.final_fit else 0)
     seg_h = rounds * per_epoch * a.seg_epochs / 3600
     # Classifier: measured ~6 min per fold for ~700 photos at 384 px on a T4; scales with the photo count.
     n_cls = int((pd.read_csv(ROOT / a.cls_manifest if not Path(a.cls_manifest).is_absolute() else a.cls_manifest)
                  .split != "test").sum()) if not a.skip_cls else 0
     cls_h = rounds * 6 * max(1.0, n_cls / 700) / 60 + folds * 3 / 60  # + evaluation ~3 min per fold
-    print(f"timing: {per_epoch:.0f} s per outline epoch at {a.seg_size}px; {folds} folds on {max(1, gpus)} GPU(s) "
+    print(f"timing: {per_epoch:.0f} s per outline epoch at {a.seg_size}px; {folds} folds{' + the final fit' if a.final_fit else ''} on {max(1, gpus)} GPU(s) "
           f"-> about {seg_h + cls_h:.1f} h (worst case: all {a.seg_epochs} epochs, no early stop)", flush=True)
     return seg_h + cls_h
 

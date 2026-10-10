@@ -90,7 +90,7 @@ export class ShareService {
     });
     if (!c) throw new GoneException('This link is no longer available.');
     const results = await this.prisma.aIResult.findMany({
-      where: { status: 'ok', phase: { treatment: { caseId: c.id, deletedAt: null } } },
+      where: { status: 'ok', phase: { phaseType: 'PRE', treatment: { caseId: c.id, deletedAt: null } } },
       orderBy: { createdAt: 'asc' },
       select: {
         createdAt: true,

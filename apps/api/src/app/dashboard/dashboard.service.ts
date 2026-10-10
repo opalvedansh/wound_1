@@ -15,7 +15,7 @@ import { decodeCursor, encodeCursor, limitFrom } from '../platform/pagination';
 import { PatientsService } from '../patients/patients.service';
 import { PrismaService } from '../prisma.service';
 import { StorageService } from '../visits/storage.service';
-import { areaChangePct, day, iso } from '../views';
+import { areaChangePct, day, iso, PRE_VISIT } from '../views';
 
 const DAY_MS = 86_400_000;
 const DASHBOARD_TTL = 30;
@@ -65,7 +65,7 @@ export class DashboardService {
     const eightWeeksAgo = new Date(now.getTime() - 56 * DAY_MS);
     const inAWeek = new Date(now.getTime() + 7 * DAY_MS);
     const openCase = { clinicId, deletedAt: null, closedAt: null };
-    const okVisit = { clinicId, status: 'ok' };
+    const okVisit = { clinicId, status: 'ok', ...PRE_VISIT };
 
     const [patients, openWounds, thisWeek, lastWeek, drafts, urgentDrafts, attentionCount, weekly, types, progress, attention, upcoming] =
       await Promise.all([
@@ -81,7 +81,7 @@ export class DashboardService {
             AND c.status IN ('overdue', 'review') AND ${unreviewed()}`,
         this.prisma.$queryRaw<{ week: Date; n: bigint }[]>`
           SELECT date_trunc('week', "createdAt") AS week, count(*) AS n FROM "AIResult"
-          WHERE "clinicId" = ${clinicId} AND status = 'ok' AND "createdAt" >= ${eightWeeksAgo}
+          WHERE "clinicId" = ${clinicId} AND status = 'ok' AND "reviewStatus" <> 'included' AND "createdAt" >= ${eightWeeksAgo}
           GROUP BY 1 ORDER BY 1`,
         this.prisma.case.groupBy({ by: ['woundType'], where: openCase, _count: { _all: true } }),
         this.prisma.case.findMany({

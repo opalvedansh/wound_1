@@ -67,7 +67,7 @@ export class SummaryService {
           select: {
             nextVisit: true,
             phases: {
-              where: { deletedAt: null },
+              where: { deletedAt: null, phaseType: 'PRE' },
               select: { aiResult: { select: { id: true, status: true, area: true, urgent: true, findings: true, createdAt: true } } },
             },
           },

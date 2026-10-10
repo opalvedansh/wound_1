@@ -1,5 +1,5 @@
 import React from 'react';
-import { Pressable, StyleSheet, View, useWindowDimensions } from 'react-native';
+import { Image, Pressable, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { useNavigation, useRoute, type RouteProp } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Feather from '@expo/vector-icons/Feather';
@@ -8,6 +8,7 @@ import { ActionButton } from '../components/ActionButton';
 import { CaptureTopBar, captureColors, captureFocus } from '../components/CaptureChrome';
 import { Text } from '../components/Typography';
 import { PHASE_NAME } from '../lib/format';
+import { postPhoto, prePhoto } from '../lib/photos';
 import { interactionStyle } from '../lib/interaction';
 import { useTreatmentContext } from '../lib/treatmentContext';
 import { mockAiAdapter } from '../lib/mockAiAdapter';
@@ -38,21 +39,17 @@ export const CameraScreen = () => {
   const [calibrated, setCalibrated] = React.useState(false);
   const [calibrating, setCalibrating] = React.useState(false);
 
-  // A follow-up treatment starts with the previous post-treatment image as its pre-treatment image, so review that
-  // first. It's pushed rather than replaced so Retake comes back to this camera, and only while this screen is
-  // showing: approving a new image on the review above it changes preImageUri too.
-  const inheritedReviewed = React.useRef(false);
-  React.useEffect(() => {
-    if (step === 'pre' && treatment?.preImageUri && !inheritedReviewed.current && navigation.isFocused()) {
-      inheritedReviewed.current = true;
-      navigation.navigate('ImageReview', { treatmentId, step, imageUri: treatment.preImageUri });
-    }
-  }, [step, treatment?.preImageUri, navigation, treatmentId]);
+  // Last visit's photo of this wound, faintly over the viewfinder, so the new photo is taken from the same distance
+  // and angle: healing is measured by comparing the two. After-cleaning photos are compared with each other.
+  const previous = useVisitStore((state) =>
+    state.treatments
+      .filter((t) => t.caseId === treatment?.caseId && t.sequenceNumber < (treatment?.sequenceNumber ?? 0))
+      .sort((a, b) => b.sequenceNumber - a.sequenceNumber)[0],
+  );
+  const framingUri = step === 'post' ? postPhoto(previous) : prePhoto(previous) ?? postPhoto(previous);
 
-  // The capture guide opens by itself the first time the camera is used (unless a carried-forward image is being
-  // reviewed first); after that it's behind the help button.
+  // The capture guide opens by itself the first time the camera is used; after that it's behind the help button.
   React.useEffect(() => {
-    if (step === 'pre' && treatment?.preImageUri) return;
     let cancelled = false;
     Promise.resolve(secureStorage.getItem(CAPTURE_GUIDE_SEEN))
       .then(async (seen) => {
@@ -152,9 +149,11 @@ export const CameraScreen = () => {
     : calibrating
       ? { icon: 'loader' as const, color: captureColors.text, text: 'Looking for the calibration sticker' }
       : { icon: 'alert-circle' as const, color: captureColors.warning, text: 'Not calibrated' };
-  const guidance = calibrated
-    ? 'Frame the whole wound inside the guide.'
-    : 'Place the calibration sticker next to the wound, inside the guide.';
+  const guidance = !calibrated
+    ? 'Place the calibration sticker next to the wound, inside the guide.'
+    : step === 'post'
+      ? 'After cleaning, before the dressing goes on. Frame the whole wound inside the guide.'
+      : 'Frame the whole wound inside the guide.';
 
   return (
     <View style={styles.screen}>
@@ -170,6 +169,14 @@ export const CameraScreen = () => {
 
       <View style={styles.viewfinder}>
         <CameraView style={StyleSheet.absoluteFill} ref={cameraRef} facing="back" />
+        {framingUri && (
+          <Image
+            source={{ uri: framingUri }}
+            style={[StyleSheet.absoluteFill, styles.framing]}
+            resizeMode="cover"
+            accessibilityLabel="Last visit's photo, shown faintly to line up the new one"
+          />
+        )}
 
         <View style={styles.guideLayer}>
           <View style={{ width: guideSize, height: guideSize }}>
@@ -237,6 +244,10 @@ const styles = StyleSheet.create({
     backgroundColor: '#15181B',
   },
 
+  framing: {
+    opacity: 0.28,
+    pointerEvents: 'none',
+  },
   guideLayer: {
     position: 'absolute',
     top: 0,

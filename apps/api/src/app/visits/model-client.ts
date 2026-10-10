@@ -3,7 +3,10 @@ import type {
   AnalyzeResponse,
   IntakeAnswers,
   IntakeQuestion,
+  PhotoPhase,
   ReviewDecision,
+  TreatmentReportRequest,
+  TreatmentReportResponse,
 } from '@antigravity-project-spec-pack/domain/wound-model';
 
 const ANALYZE_TIMEOUT_MS = 60_000; // a hosted model that has gone to sleep can take most of this to start
@@ -51,6 +54,7 @@ export class ModelClient {
     photo: { buffer: Buffer; mimetype: string },
     intake: IntakeAnswers,
     previous?: { area_cm2: number; days_ago: number },
+    phase: PhotoPhase = 'pre',
   ): Promise<AnalyzeResponse> {
     const res = await this.call(
       '/analyze',
@@ -60,11 +64,22 @@ export class ModelClient {
         form.append('image', new Blob([new Uint8Array(photo.buffer)], { type: photo.mimetype }), 'photo');
         form.append('intake', JSON.stringify(intake));
         if (previous) form.append('previous', JSON.stringify(previous));
+        form.append('phase', phase);
         return { method: 'POST', body: form };
       },
       ANALYZE_TIMEOUT_MS,
     );
     return (await res.json()) as AnalyzeResponse;
+  }
+
+  /** Healing, care suggestions and the draft for a treatment, from findings already stored (no photos sent). */
+  async treatmentReport(req: TreatmentReportRequest): Promise<TreatmentReportResponse> {
+    const res = await this.call(
+      '/treatment-report',
+      () => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req) }),
+      QUESTIONS_TIMEOUT_MS,
+    );
+    return (await res.json()) as TreatmentReportResponse;
   }
 
   /** Tells the model service about the clinician's decision (kept only in a consented study). Never fails the caller. */

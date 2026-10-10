@@ -198,6 +198,7 @@ model Image {
   phase     Phase    @relation(fields: [phaseId], references: [id], onDelete: Cascade)
   imageUrl  String // storage path of the full photo
   thumbPath String? // storage path of the 320 px thumbnail
+  sha256    String? // of the photo's bytes: the same photo is never analysed twice for one wound
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -224,8 +225,13 @@ model AIResult {
   draftReport      String?
   modelVersions    Json?
   modelCaseId      String?
-  // Review queue fields, kept in step with `review`.
-  reviewStatus     String    @default("pending") // pending | approved | edited | rejected
+  // The treatment report, kept on the PRE result: healing so far, what the session did, care suggestions.
+  progress         Json? // wound-ai /treatment-report `progress`
+  care             Json? // { suggestions, contraindications, checks }
+  rulesVersion     String?
+  // Review queue fields, kept in step with `review`. A POST result is `included`: it feeds its treatment's PRE
+  // result (the one review per treatment) and never enters the queue itself.
+  reviewStatus     String    @default("pending") // pending | approved | edited | rejected | included
   urgent           Boolean   @default(false)
   flagCount        Int       @default(0)
   review           AIReview?

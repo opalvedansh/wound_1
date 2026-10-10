@@ -37,6 +37,7 @@ import { StorageService } from './visits/storage.service';
 import { SyncController } from './sync/sync.controller';
 import { SyncService } from './sync/sync.service';
 import { VisitsController } from './visits/visits.controller';
+import { TreatmentReportService } from './visits/treatment-report.service';
 import { VisitsService } from './visits/visits.service';
 
 @Module({
@@ -80,6 +81,7 @@ import { VisitsService } from './visits/visits.service';
     PatientsService,
     CasesService,
     VisitsService,
+    TreatmentReportService,
     SyncService,
     DashboardService,
     ClinicService,

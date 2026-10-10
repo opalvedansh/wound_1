@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { Queue, Worker, type JobsOptions } from 'bullmq';
 
-export type JobName = 'analyze-visit' | 'thumbnail' | 'forward-review' | 'purge';
+export type JobName = 'analyze-visit' | 'thumbnail' | 'forward-review' | 'purge' | 'treatment-report';
 /** `final` is true on the last attempt, so a handler can record a permanent failure instead of retrying. */
 export interface JobMeta {
   final: boolean;

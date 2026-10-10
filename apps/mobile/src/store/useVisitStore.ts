@@ -90,8 +90,8 @@ export const useVisitStore = create<VisitState>()(
             caseId,
             sequenceNumber: Math.max(0, ...caseTreatments.map((t) => t.sequenceNumber)) + 1,
             phase: 'PRE',
-            // The pre-treatment photo starts as the previous visit's post-treatment photo.
-            preImageUri: previous?.postImageUri,
+            // Every visit takes its own pre-treatment photo: last visit's photo, carried over, would make the wound
+            // look unchanged. The camera shows it as a framing guide instead (CameraScreen).
             assessment: previous?.assessment ? { ...previous.assessment } : undefined,
             createdAt: new Date().toISOString(),
           };

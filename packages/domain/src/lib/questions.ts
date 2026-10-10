@@ -182,7 +182,18 @@ export const DEFAULT_QUESTIONS: Question[] = [
     fieldKey: 'therapyGiven',
     title: 'THERAPY GIVEN',
     type: 'chip_multi',
-    options: ['Debridement', 'Cleansing', 'Negative Pressure (NPWT)', 'Skin Substitute', 'Compression', 'None'],
+    // Offloading and pressure redistribution are the main treatments for diabetic foot ulcers and pressure
+    // injuries; the care suggestions (wound-ai/wound_ai/care.py) use these exact names.
+    options: [
+      'Debridement',
+      'Cleansing',
+      'Negative Pressure (NPWT)',
+      'Skin Substitute',
+      'Compression',
+      'Offloading',
+      'Pressure redistribution',
+      'None',
+    ],
     required: false,
     order: 0,
     followUpOnly: false,

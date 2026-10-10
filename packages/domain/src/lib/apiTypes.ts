@@ -3,7 +3,7 @@
  * Import through `@antigravity-project-spec-pack/domain/api` (the package index pulls in a browser client).
  * Dates are ISO strings; calendar days are YYYY-MM-DD.
  */
-import type { AnalyzeResponse, IntakeAnswers, ReviewDecision } from './woundModel';
+import type { AnalyzeResponse, Care, IntakeAnswers, Progress, ReviewDecision } from './woundModel';
 
 export type ClinicRole = 'ADMIN' | 'DOCTOR' | 'FRONT_DESK';
 export type WoundStatus = 'healing' | 'review' | 'overdue';
@@ -111,6 +111,12 @@ export interface VisitView {
   intake: IntakeAnswers;
   draftReport: string | null;
   review: ReviewView | null;
+  /** The same visit's photo after cleaning, before the dressing; null if none was taken. */
+  post: { status: VisitStatus; photoUrl: string | null; findings: AnalyzeResponse | null } | null;
+  /** Healing and care suggestions, once the treatment report has run. */
+  progress: Progress | null;
+  care: Care | null;
+  rulesVersion: string | null;
 }
 
 export interface CaseView extends CaseCard {

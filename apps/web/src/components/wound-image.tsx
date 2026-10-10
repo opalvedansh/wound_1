@@ -1,7 +1,7 @@
 'use client';
 
 import { ImageOff } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { cx } from './ui';
 
 type Outline = [number, number][][];
@@ -30,6 +30,13 @@ export function WoundImage({
 }) {
   const [size, setSize] = useState<{ w: number; h: number } | null>(null);
   const [failed, setFailed] = useState(false);
+  const img = useRef<HTMLImageElement>(null);
+  // A cached photo can finish loading before React hydrates, so onLoad never fires and the outline would never
+  // be drawn: read the size from an image that is already complete.
+  useEffect(() => {
+    const el = img.current;
+    if (el?.complete && el.naturalWidth) setSize({ w: el.naturalWidth, h: el.naturalHeight });
+  }, [src]);
 
   if (!src || failed) {
     return (
@@ -49,6 +56,7 @@ export function WoundImage({
     <div className={cx('relative overflow-hidden bg-surface-alt', className)} style={{ aspectRatio: `${1 / aspect}` }}>
       {/* eslint-disable-next-line @next/next/no-img-element -- signed storage URL, already resized */}
       <img
+        ref={img}
         src={src}
         alt={label}
         loading={eager ? 'eager' : 'lazy'}

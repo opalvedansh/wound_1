@@ -1,4 +1,4 @@
-import type { AnalyzeResponse, IntakeAnswers, ReviewDecision } from '@antigravity-project-spec-pack/domain/wound-model';
+import type { AnalyzeResponse, Care, IntakeAnswers, Progress, ReviewDecision } from '@antigravity-project-spec-pack/domain/wound-model';
 import type { CaseCard, Consent, PatientListItem, ReviewView, VisitStatus, VisitView, WoundStatus } from '@antigravity-project-spec-pack/domain/api';
 
 /** Database rows as the JSON clients read: ISO timestamps, YYYY-MM-DD calendar days. */
@@ -102,6 +102,11 @@ export const toReviewView = (r: ReviewRow): ReviewView => ({
   createdAt: r.createdAt.toISOString(),
 });
 
+interface ImageRow {
+  imageUrl: string;
+  thumbPath: string | null;
+}
+
 export interface VisitRow {
   id: string;
   status: string;
@@ -109,10 +114,22 @@ export interface VisitRow {
   findings: unknown;
   intake: unknown;
   draftReport: string | null;
+  progress: unknown;
+  care: unknown;
+  rulesVersion: string | null;
   createdAt: Date;
   review?: ReviewRow | null;
-  phase: { treatment: { id: string; sequence: number }; image: { imageUrl: string; thumbPath: string | null } | null };
+  phase: {
+    treatment: { id: string; sequence: number; phases: { image: ImageRow | null; aiResult: { status: string; findings: unknown } | null }[] };
+    image: ImageRow | null;
+  };
 }
+
+/**
+ * A visit is a treatment's PRE result: the one a clinician reviews. The POST result (same visit, after cleaning)
+ * is shown inside it, so every list of visits filters on this.
+ */
+export const PRE_VISIT = { phase: { phaseType: 'PRE' } } as const;
 
 export const toVisitView = (r: VisitRow, urls: Map<string, string | null>): VisitView => ({
   id: r.id,
@@ -127,11 +144,28 @@ export const toVisitView = (r: VisitRow, urls: Map<string, string | null>): Visi
   intake: (r.intake ?? {}) as IntakeAnswers,
   draftReport: r.draftReport,
   review: r.review ? toReviewView(r.review) : null,
+  post: postOf(r, urls),
+  progress: (r.progress as Progress | null) ?? null,
+  care: (r.care as Care | null) ?? null,
+  rulesVersion: r.rulesVersion,
 });
+
+const postOf = (r: VisitRow, urls: Map<string, string | null>): VisitView['post'] => {
+  const post = r.phase.treatment.phases[0];
+  if (!post?.image) return null;
+  return {
+    status: (post.aiResult?.status ?? 'processing') as VisitStatus,
+    photoUrl: urls.get(post.image.imageUrl) ?? null,
+    findings: (post.aiResult?.findings as AnalyzeResponse | null) ?? null,
+  };
+};
 
 /** Storage paths to sign for a set of visits (photo and thumbnail). */
 export const visitPaths = (rows: VisitRow[]) =>
-  rows.flatMap((r) => (r.phase.image ? [r.phase.image.imageUrl, r.phase.image.thumbPath ?? ''] : [])).filter(Boolean);
+  rows
+    .flatMap((r) => [r.phase.image, r.phase.treatment.phases[0]?.image ?? null])
+    .flatMap((img) => (img ? [img.imageUrl, img.thumbPath ?? ''] : []))
+    .filter(Boolean);
 
 export const visitSelect = {
   id: true,
@@ -140,7 +174,24 @@ export const visitSelect = {
   findings: true,
   intake: true,
   draftReport: true,
+  progress: true,
+  care: true,
+  rulesVersion: true,
   createdAt: true,
   review: true,
-  phase: { select: { treatment: { select: { id: true, sequence: true } }, image: { select: { imageUrl: true, thumbPath: true } } } },
+  phase: {
+    select: {
+      treatment: {
+        select: {
+          id: true,
+          sequence: true,
+          phases: {
+            where: { phaseType: 'POST', deletedAt: null },
+            select: { image: { select: { imageUrl: true, thumbPath: true } }, aiResult: { select: { status: true, findings: true } } },
+          },
+        },
+      },
+      image: { select: { imageUrl: true, thumbPath: true } },
+    },
+  },
 } as const;

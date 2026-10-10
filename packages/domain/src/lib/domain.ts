@@ -79,7 +79,7 @@ export interface TreatmentRemote {
   /** Signed links to the stored photos, for devices that don't have them locally. Valid for a few hours. */
   preUrl?: string | null;
   postUrl?: string | null;
-  /** The AI draft for the pre-treatment photo. */
+  /** The AI draft for the visit (its pre-treatment photo, with the post-treatment photo folded in). */
   ai?: {
     visitId: string;
     status: 'processing' | 'ok' | 'retake' | 'no_wound_found' | 'failed';
@@ -87,6 +87,14 @@ export interface TreatmentRemote {
     woundType: string | null;
     urgent: boolean;
     review: 'approved' | 'edited' | 'rejected' | null;
+    /** Analysis of the post-treatment photo; null before one is uploaded. */
+    postStatus?: 'processing' | 'ok' | 'retake' | 'no_wound_found' | 'failed' | null;
+    /** Healing since the last visit, judged like with like; null until there are two comparable photos. */
+    trajectory?: 'improving' | 'static' | 'deteriorating' | null;
+    /** Positive = smaller than the first photo. */
+    areaReductionSinceFirstPct?: number | null;
+    /** Care suggestions, only once a clinician approved or edited the draft. */
+    suggestions?: { action: string; text: string }[] | null;
   } | null;
 }
 

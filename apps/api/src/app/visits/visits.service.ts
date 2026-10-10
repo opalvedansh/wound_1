@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   BadRequestException,
   ConflictException,
@@ -27,11 +27,13 @@ import { JobsService, type JobMeta } from '../platform/jobs.service';
 import { parse } from '../platform/validation';
 import { PrismaService } from '../prisma.service';
 import { UsersService } from '../users.service';
-import { toReviewView, toVisitView, visitPaths, visitSelect } from '../views';
+import { PRE_VISIT, toReviewView, toVisitView, visitPaths, visitSelect } from '../views';
 import { ModelClient } from './model-client';
 import { StorageService } from './storage.service';
 
 export const MAX_PHOTO_BYTES = 15 * 1024 * 1024; // the model service's own limit
+
+const sha256Of = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 const THUMB_WIDTH = 320;
 const DAY_MS = 86_400_000;
 
@@ -130,6 +132,8 @@ export class VisitsService implements OnModuleInit {
     if (photo.size > MAX_PHOTO_BYTES) throw new PayloadTooLargeException('The photo is larger than 15 MB.');
     const type = imageType(photo.buffer);
     if (!type) throw new BadRequestException('The photo must be a JPEG or PNG image.');
+    const sha256 = sha256Of(photo.buffer);
+    if (await this.isRepeat(caseId, sha256)) throw new BadRequestException('This photo is already on this wound. Take a new one.');
 
     const answers = parseAnswers(rawAnswers);
     const missing = missingIntake(answers as IntakeAnswers);
@@ -150,7 +154,7 @@ export class VisitsService implements OnModuleInit {
         const last = await tx.treatment.findFirst({ where: { caseId }, orderBy: { sequence: 'desc' }, select: { sequence: true } });
         await tx.treatment.create({ data: { id: treatmentId, clinicId: ctx.clinicId, caseId, sequence: (last?.sequence ?? 0) + 1, therapy: [] } });
         await tx.phase.create({ data: { id: phaseId, clinicId: ctx.clinicId, treatmentId, phaseType: 'PRE' } });
-        await tx.image.create({ data: { phaseId, imageUrl: path } });
+        await tx.image.create({ data: { phaseId, imageUrl: path, sha256 } });
         const result = await tx.aIResult.create({
           data: { clinicId: ctx.clinicId, phaseId, status: 'processing', intake: intake as Prisma.InputJsonValue },
           select: { id: true },
@@ -167,8 +171,11 @@ export class VisitsService implements OnModuleInit {
   }
 
   /**
-   * A photo the mobile app took for a treatment it has already synced. The pre-treatment photo is analysed like
-   * a portal visit; the post-treatment photo is kept for the record. Sending the same photo again is harmless.
+   * A photo the mobile app took for a treatment it has already synced. Both are analysed: the pre-treatment photo
+   * like a portal visit, the post-treatment photo (after cleaning, before the dressing) as part of that visit's
+   * review rather than a draft of its own. Sending the same photo again is harmless. A photo already stored for
+   * another visit of this wound (such as last visit's photo carried over) is kept but not analysed: comparing a
+   * photo with itself would report a wound that never changed.
    */
   async attachSyncedPhoto(
     ctx: ClinicContext,
@@ -179,7 +186,7 @@ export class VisitsService implements OnModuleInit {
   ): Promise<{ visitId: string | null }> {
     const t = await this.prisma.treatment.findFirst({
       where: { id: treatmentId, clinicId: ctx.clinicId, deletedAt: null },
-      select: { id: true, phases: { where: { phaseType }, select: { id: true, image: { select: { phaseId: true } }, aiResult: { select: { id: true } } } } },
+      select: { id: true, caseId: true, phases: { where: { phaseType }, select: { id: true, image: { select: { phaseId: true } }, aiResult: { select: { id: true } } } } },
     });
     if (!t) throw new NotFoundException('Treatment not found. Sync it first.');
     const existing = t.phases[0];
@@ -189,16 +196,24 @@ export class VisitsService implements OnModuleInit {
     const type = imageType(photo.buffer);
     if (!type) throw new BadRequestException('The photo must be a JPEG or PNG image.');
 
+    const sha256 = sha256Of(photo.buffer);
+    const repeat = await this.isRepeat(t.caseId, sha256);
     const path = `${ctx.clinicId}/treatments/${t.id}/${phaseType.toLowerCase()}.${type === 'image/png' ? 'png' : 'jpg'}`;
     await this.storage.upload(path, photo.buffer, type);
     let visitId: string | null = null;
     try {
       visitId = await this.prisma.$transaction(async (tx) => {
         const phaseId = existing?.id ?? (await tx.phase.create({ data: { clinicId: ctx.clinicId, treatmentId: t.id, phaseType }, select: { id: true } })).id;
-        await tx.image.create({ data: { phaseId, imageUrl: path } });
-        if (phaseType !== 'PRE') return null;
+        await tx.image.create({ data: { phaseId, imageUrl: path, sha256 } });
+        if (repeat) return null;
         const result = await tx.aIResult.create({
-          data: { clinicId: ctx.clinicId, phaseId, status: 'processing', intake: intake as Prisma.InputJsonValue },
+          data: {
+            clinicId: ctx.clinicId,
+            phaseId,
+            status: 'processing',
+            intake: intake as Prisma.InputJsonValue,
+            ...(phaseType === 'POST' ? { reviewStatus: 'included' } : {}),
+          },
           select: { id: true },
         });
         return result.id;
@@ -209,7 +224,9 @@ export class VisitsService implements OnModuleInit {
     }
     if (visitId) {
       await this.jobs.enqueue('analyze-visit', { visitId }, { jobId: `analyze-${visitId}` });
-      await this.audit.log({ clinicId: ctx.clinicId, userId: ctx.userId, action: 'visit.create', entity: 'AIResult', entityId: visitId, details: { from: 'app' } });
+      await this.audit.log({ clinicId: ctx.clinicId, userId: ctx.userId, action: 'visit.create', entity: 'AIResult', entityId: visitId, details: { from: 'app', phase: phaseType } });
+    } else if (repeat) {
+      await this.audit.log({ clinicId: ctx.clinicId, userId: ctx.userId, action: 'visit.repeat_photo', entity: 'Treatment', entityId: t.id, details: { phase: phaseType } });
     }
     return { visitId };
   }
@@ -237,22 +254,36 @@ export class VisitsService implements OnModuleInit {
         id: true,
         status: true,
         intake: true,
-        phase: { select: { id: true, image: { select: { imageUrl: true } }, treatment: { select: { caseId: true, case: { select: { latestAreaCm2: true, lastVisitAt: true } } } } } },
+        phase: {
+          select: {
+            id: true,
+            phaseType: true,
+            treatmentId: true,
+            image: { select: { imageUrl: true } },
+            treatment: { select: { caseId: true, case: { select: { latestAreaCm2: true, lastVisitAt: true } } } },
+          },
+        },
       },
     });
     if (!row || row.status !== 'processing' || !row.phase.image) return;
     const path = row.phase.image.imageUrl;
     const { case: c, caseId } = row.phase.treatment;
+    const post = row.phase.phaseType === 'POST';
     // The case summary still describes the visits before this one: exactly what "previous" means.
     const previous =
-      c.latestAreaCm2 && c.lastVisitAt
+      !post && c.latestAreaCm2 && c.lastVisitAt
         ? { area_cm2: c.latestAreaCm2, days_ago: Math.max(0, Math.round((Date.now() - c.lastVisitAt.getTime()) / DAY_MS)) }
         : undefined;
 
     let findings: AnalyzeResponse;
     try {
       const photo = await this.storage.download(path);
-      findings = await this.model.analyze({ buffer: photo, mimetype: path.endsWith('.png') ? 'image/png' : 'image/jpeg' }, row.intake as IntakeAnswers, previous);
+      findings = await this.model.analyze(
+        { buffer: photo, mimetype: path.endsWith('.png') ? 'image/png' : 'image/jpeg' },
+        row.intake as IntakeAnswers,
+        previous,
+        post ? 'post' : 'pre',
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // Let the queue retry; after the last attempt the visit shows as failed with a Retry button.
@@ -264,8 +295,14 @@ export class VisitsService implements OnModuleInit {
       throw error;
     }
 
+    if (findings.status !== 'ok' && post) {
+      // The dressing is on by now, so it can't be retaken: the photo stays on the record, marked as not analysable.
+      await this.prisma.aIResult.update({ where: { id: visitId }, data: { status: findings.status, findings: findings as unknown as Prisma.InputJsonValue } });
+      await Promise.all([this.touch(visitId), this.reportJob(row.phase.treatmentId, 'post')]);
+      return;
+    }
     if (findings.status !== 'ok') {
-      // A photo the model can't use is never kept: the clinician retakes it.
+      // A pre-treatment photo the model can't use is never kept: the clinician retakes it.
       await this.prisma.$transaction([
         this.prisma.aIResult.update({ where: { id: visitId }, data: { status: findings.status, findings: findings as unknown as Prisma.InputJsonValue } }),
         this.prisma.image.deleteMany({ where: { phaseId: row.phase.id } }),
@@ -294,8 +331,20 @@ export class VisitsService implements OnModuleInit {
         flagCount: flags.length,
       },
     });
-    await Promise.all([this.summary.refreshCase(caseId), this.touch(visitId)]);
+    await Promise.all([post ? undefined : this.summary.refreshCase(caseId), this.touch(visitId)]);
     await this.jobs.enqueue('thumbnail', { visitId });
+    await this.reportJob(row.phase.treatmentId, post ? 'post' : 'pre');
+  }
+
+  /** Healing and care suggestions for the treatment, written onto its PRE result (TreatmentReportService). */
+  private reportJob(treatmentId: string, trigger: 'pre' | 'post') {
+    return this.jobs.enqueue('treatment-report', { treatmentId, trigger }, { jobId: `report-${treatmentId}-${trigger}-${Date.now()}` });
+  }
+
+  /** The same photo already stored for this wound. */
+  private async isRepeat(caseId: string, sha256: string): Promise<boolean> {
+    const hit = await this.prisma.image.findFirst({ where: { sha256, phase: { treatment: { caseId, deletedAt: null } } }, select: { phaseId: true } });
+    return !!hit;
   }
 
   /** Background job: a 320 px thumbnail for lists and cards (a fraction of the photo's size). */
@@ -317,7 +366,7 @@ export class VisitsService implements OnModuleInit {
   async review(ctx: ClinicContext, id: string, raw: unknown): Promise<ReviewView> {
     const input = parse(reviewInput, raw, 'Check the review.');
     const result = await this.prisma.aIResult.findFirst({
-      where: { id, clinicId: ctx.clinicId, status: 'ok' },
+      where: { id, clinicId: ctx.clinicId, status: 'ok', ...PRE_VISIT },
       select: { id: true, draftReport: true, review: { select: { id: true } } },
     });
     if (!result) throw new NotFoundException('Result not found.');
@@ -395,7 +444,8 @@ export class VisitsService implements OnModuleInit {
     const dayAgo = new Date(Date.now() - DAY_MS);
     const monthAgo = new Date(Date.now() - 30 * DAY_MS);
     const stale = await this.prisma.aIResult.findMany({
-      where: { status: { in: ['retake', 'no_wound_found'] }, createdAt: { lt: dayAgo } },
+      // PRE only: a POST photo the model couldn't use is kept, and its visit with it.
+      where: { status: { in: ['retake', 'no_wound_found'] }, createdAt: { lt: dayAgo }, ...PRE_VISIT },
       select: { phase: { select: { treatmentId: true } } },
     });
     const treatmentIds = stale.map((s) => s.phase.treatmentId);

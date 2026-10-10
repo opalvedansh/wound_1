@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import type { ClinicContext } from '../auth/clinic.guard';
 import { AuditService } from '../platform/audit.service';
 import { PrismaService } from '../prisma.service';
+import { PRE_VISIT } from '../views';
 
 const BATCH = 1000;
 
@@ -93,7 +94,7 @@ export class ExportsService {
     let after: string | undefined;
     for (;;) {
       const rows = await this.prisma.aIResult.findMany({
-        where: { clinicId: ctx.clinicId, status: 'ok', ...(after ? { id: { gt: after } } : {}) },
+        where: { clinicId: ctx.clinicId, status: 'ok', ...PRE_VISIT, ...(after ? { id: { gt: after } } : {}) },
         orderBy: { id: 'asc' },
         take: BATCH,
         select: {

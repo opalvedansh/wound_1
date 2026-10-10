@@ -58,7 +58,7 @@ export class CasesService {
       this.owned(ctx, id),
       this.visits(ctx, id, {}),
       this.prisma.aIResult.findMany({
-        where: { clinicId: ctx.clinicId, status: 'ok', area: { not: null }, phase: { treatment: { caseId: id, deletedAt: null } } },
+        where: { clinicId: ctx.clinicId, status: 'ok', area: { not: null }, phase: { phaseType: 'PRE', treatment: { caseId: id, deletedAt: null } } },
         orderBy: { createdAt: 'asc' },
         select: { area: true, createdAt: true, phase: { select: { treatment: { select: { sequence: true } } } } },
       }),
@@ -85,7 +85,7 @@ export class CasesService {
     const rows = await this.prisma.aIResult.findMany({
       where: {
         AND: [
-          { clinicId: ctx.clinicId, status: { in: ['ok', 'processing', 'failed'] }, phase: { treatment: { caseId, deletedAt: null } } },
+          { clinicId: ctx.clinicId, status: { in: ['ok', 'processing', 'failed'] }, phase: { phaseType: 'PRE', treatment: { caseId, deletedAt: null } } },
           after,
         ],
       },

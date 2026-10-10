@@ -217,7 +217,7 @@ export function useMarkReviewed(caseId: string) {
 export function useReviewVisit(caseId: string, visitId: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (body: { decision: 'approved' | 'edited' | 'rejected'; finalReport?: string; reason?: string }) =>
+    mutationFn: (body: { decision: 'approved' | 'edited' | 'rejected'; finalReport?: string; reason?: string; corrections?: Record<string, unknown> }) =>
       send<ReviewView>(`/visits/${visitId}/review`, 'POST', body),
     onSuccess: (review) => {
       qc.setQueryData<CaseView>(keys.case(caseId), (cv) =>

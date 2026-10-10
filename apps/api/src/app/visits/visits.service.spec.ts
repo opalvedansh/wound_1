@@ -56,7 +56,10 @@ const visitRow = (id: string, status = 'processing') => ({
   draftReport: null,
   createdAt: new Date('2026-10-08T10:00:00Z'),
   review: null,
-  phase: { treatment: { id: 't1', sequence: 1 }, image: { imageUrl: 'k1/treatments/t1/pre.jpg', thumbPath: null } },
+  progress: null,
+  care: null,
+  rulesVersion: null,
+  phase: { treatment: { id: 't1', sequence: 1, phases: [] }, image: { imageUrl: 'k1/treatments/t1/pre.jpg', thumbPath: null } },
 });
 
 /** The row the analyze job loads. */
@@ -66,13 +69,17 @@ const pending = (overrides: Record<string, unknown> = {}) => ({
   intake: { diabetes: 'no', cause: 'burn' },
   phase: {
     id: 'ph1',
+    phaseType: 'PRE',
+    treatmentId: 't1',
     image: { imageUrl: 'k1/treatments/t1/pre.jpg' },
     treatment: { caseId: 'c1', case: { latestAreaCm2: 5, lastVisitAt: new Date(Date.now() - 7 * DAY) } },
   },
   ...overrides,
 });
 
-function setup(options: { transactionFails?: boolean; result?: unknown; job?: unknown; findings?: AnalyzeResponse; modelFails?: boolean } = {}) {
+function setup(
+  options: { transactionFails?: boolean; result?: unknown; job?: unknown; findings?: AnalyzeResponse; modelFails?: boolean; repeat?: boolean; treatment?: unknown } = {},
+) {
   const created: Record<string, Record<string, unknown>[]> = { treatment: [], phase: [], image: [], aIResult: [] };
   const record = (table: string) => ({
     create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
@@ -100,8 +107,8 @@ function setup(options: { transactionFails?: boolean; result?: unknown; job?: un
       update: jest.fn(async ({ data }: { data: Record<string, unknown> }) => data),
     },
     aIReview: { create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => ({ ...data, createdAt: new Date('2026-10-08T11:00:00Z') })) },
-    image: { deleteMany: jest.fn(async () => ({ count: 1 })) },
-    treatment: { updateMany: jest.fn(async () => ({ count: 1 })) },
+    image: { deleteMany: jest.fn(async () => ({ count: 1 })), findFirst: jest.fn(async () => (options.repeat ? { phaseId: 'old' } : null)) },
+    treatment: { updateMany: jest.fn(async () => ({ count: 1 })), findFirst: jest.fn(async () => options.treatment ?? null) },
   };
   const model = {
     questions: jest.fn(async () => CORE),
@@ -174,6 +181,12 @@ describe('VisitsService.create', () => {
     expect(storage.upload).not.toHaveBeenCalled();
   });
 
+  it('refuses a photo already on this wound, before storing anything', async () => {
+    const { service, storage } = setup({ repeat: true });
+    await expect(service.create(ctx, 'c1', photo, JSON.stringify(ANSWERS))).rejects.toThrow('already on this wound');
+    expect(storage.upload).not.toHaveBeenCalled();
+  });
+
   it("treats another clinic's wound as not found", async () => {
     const { service, storage } = setup();
     await expect(service.create({ ...ctx, clinicId: 'k2' }, 'c1', photo, JSON.stringify(ANSWERS))).rejects.toBeInstanceOf(NotFoundException);
@@ -193,13 +206,33 @@ describe('VisitsService.analyze (background job)', () => {
   it("writes the model's findings, refreshes the wound's summary and queues a thumbnail", async () => {
     const { service, prisma, model, summary, jobs } = setup({ job: pending() });
     await service.analyze('v1');
-    expect(model.analyze).toHaveBeenCalledWith({ buffer: jpeg, mimetype: 'image/jpeg' }, { diabetes: 'no', cause: 'burn' }, { area_cm2: 5, days_ago: 7 });
+    expect(model.analyze).toHaveBeenCalledWith({ buffer: jpeg, mimetype: 'image/jpeg' }, { diabetes: 'no', cause: 'burn' }, { area_cm2: 5, days_ago: 7 }, 'pre');
     expect(prisma.aIResult.update).toHaveBeenCalledWith({
       where: { id: 'v1' },
       data: expect.objectContaining({ status: 'ok', area: 4.2, length: 3.1, height: 1.8, confidenceScore: 0.86, modelCaseId: 'model-case-1', urgent: true, flagCount: 1 }),
     });
     expect(summary.refreshCase).toHaveBeenCalledWith('c1');
     expect(jobs.enqueue).toHaveBeenCalledWith('thumbnail', { visitId: 'v1' });
+    expect(jobs.enqueue).toHaveBeenCalledWith('treatment-report', { treatmentId: 't1', trigger: 'pre' }, expect.anything());
+  });
+
+  it('analyses a post-treatment photo as part of its visit, without a previous-area comparison', async () => {
+    const job = pending({ phase: { ...pending().phase, phaseType: 'POST', image: { imageUrl: 'k1/treatments/t1/post.jpg' } } });
+    const { service, model, summary, jobs } = setup({ job });
+    await service.analyze('v1');
+    expect(model.analyze).toHaveBeenCalledWith(expect.anything(), expect.anything(), undefined, 'post');
+    expect(summary.refreshCase).not.toHaveBeenCalled(); // the wound's summary follows PRE photos
+    expect(jobs.enqueue).toHaveBeenCalledWith('treatment-report', { treatmentId: 't1', trigger: 'post' }, expect.anything());
+  });
+
+  it('keeps a post-treatment photo the model cannot use: the dressing is on, so it cannot be retaken', async () => {
+    const job = pending({ phase: { ...pending().phase, phaseType: 'POST', image: { imageUrl: 'k1/treatments/t1/post.jpg' } } });
+    const { service, prisma, storage, jobs } = setup({ job, findings: { status: 'retake', quality: { ok: false, issues: ['Glare.'] } } });
+    await service.analyze('v1');
+    expect(prisma.aIResult.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: 'retake' }) }));
+    expect(prisma.image.deleteMany).not.toHaveBeenCalled();
+    expect(storage.remove).not.toHaveBeenCalled();
+    expect(jobs.enqueue).toHaveBeenCalledWith('treatment-report', { treatmentId: 't1', trigger: 'post' }, expect.anything());
   });
 
   it('never keeps a photo the model asks to retake', async () => {
@@ -226,6 +259,28 @@ describe('VisitsService.analyze (background job)', () => {
     const { service, model } = setup({ job: pending({ status: 'ok' }) });
     await service.analyze('v1');
     expect(model.analyze).not.toHaveBeenCalled();
+  });
+});
+
+describe('VisitsService.attachSyncedPhoto', () => {
+  const treatment = { id: 't1', caseId: 'c1', phases: [] };
+
+  it('analyses the post-treatment photo too, as part of the visit rather than a draft of its own', async () => {
+    const { service, created, jobs } = setup({ treatment });
+    const out = await service.attachSyncedPhoto(ctx, 't1', 'POST', photo, { diabetes: 'no', cause: 'burn' });
+    expect(out.visitId).toBe('v1');
+    expect(created['aIResult'][0]).toMatchObject({ status: 'processing', reviewStatus: 'included' });
+    expect(created['image'][0]['sha256']).toMatch(/^[0-9a-f]{64}$/);
+    expect(jobs.enqueue).toHaveBeenCalledWith('analyze-visit', { visitId: 'v1' }, expect.anything());
+  });
+
+  it("keeps a photo already on this wound (last visit's, carried over) but never analyses it", async () => {
+    const { service, created, jobs, audit } = setup({ treatment, repeat: true });
+    expect(await service.attachSyncedPhoto(ctx, 't1', 'PRE', photo, { diabetes: 'no', cause: 'burn' })).toEqual({ visitId: null });
+    expect(created['image']).toHaveLength(1);
+    expect(created['aIResult']).toHaveLength(0);
+    expect(jobs.enqueue).not.toHaveBeenCalled();
+    expect(audit.log).toHaveBeenCalledWith(expect.objectContaining({ action: 'visit.repeat_photo' }));
   });
 });
 

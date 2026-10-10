@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import type { Case, Patient, RevisitAssessment, TherapyDetails } from '@antigravity-project-spec-pack/domain';
-import type { IntakeAnswers } from '@antigravity-project-spec-pack/domain/wound-model';
+import type { Care, IntakeAnswers, Progress } from '@antigravity-project-spec-pack/domain/wound-model';
 import {
   SYNC_ENTITIES,
   type PullResponse,
@@ -465,7 +465,7 @@ export class SyncService {
                     phaseType: true,
                     assessment: true,
                     image: { select: { imageUrl: true, thumbPath: true } },
-                    aiResult: { select: { id: true, status: true, area: true, urgent: true, reviewStatus: true, findings: true } },
+                    aiResult: { select: { id: true, status: true, area: true, urgent: true, reviewStatus: true, findings: true, progress: true, care: true } },
                   },
                 },
                 case: { select: { woundType: true, comorbidities: true } },
@@ -533,7 +533,7 @@ export class SyncService {
             phaseType: true;
             assessment: true;
             image: { select: { imageUrl: true; thumbPath: true } };
-            aiResult: { select: { id: true; status: true; area: true; urgent: true; reviewStatus: true; findings: true } };
+            aiResult: { select: { id: true; status: true; area: true; urgent: true; reviewStatus: true; findings: true; progress: true; care: true } };
           };
         };
         case: { select: { woundType: true; comorbidities: true } };
@@ -547,6 +547,10 @@ export class SyncService {
     const url = (img: { imageUrl: string; thumbPath: string | null } | null | undefined) => (img ? urls.get(img.thumbPath ?? img.imageUrl) ?? null : null);
     const ai = pre?.aiResult;
     const findings = ai?.findings as { wound_type?: { label?: string } } | null;
+    const healing = (ai?.progress as Progress | null)?.healing;
+    // Suggestions reach the app only once a clinician has approved or edited the draft.
+    const approved = ai?.reviewStatus === 'approved' || ai?.reviewStatus === 'edited';
+    const care = approved ? (ai?.care as Care | null) : null;
     const therapy: TherapyDetails | undefined =
       t.therapy.length || t.dressing || t.nextVisit || t.careResponses
         ? {
@@ -592,6 +596,10 @@ export class SyncService {
               woundType: findings?.wound_type?.label ?? null,
               urgent: ai.urgent,
               review: (ai.reviewStatus === 'pending' ? null : ai.reviewStatus) as 'approved' | 'edited' | 'rejected' | null,
+              postStatus: (post?.aiResult?.status ?? null) as NonNullable<NonNullable<SyncTreatment['remote']>['ai']>['postStatus'],
+              trajectory: healing?.trajectory ?? null,
+              areaReductionSinceFirstPct: healing?.since_first?.percent_area_reduction ?? null,
+              suggestions: care ? care.suggestions.map((s) => ({ action: s.action, text: s.text })) : null,
             }
           : null,
       },
@@ -600,11 +608,12 @@ export class SyncService {
 
   // ---------------------------------------------------------------- photos
 
-  /** A photo taken in the app, sent after its treatment synced. The pre-treatment photo is analysed by the model. */
+  /** A photo taken in the app, sent after its treatment synced. Both photos are analysed by the model. */
   async photo(ctx: ClinicContext, treatmentId: string, phaseRaw: string, photo: PhotoUpload | undefined) {
     const phase = phaseRaw.toUpperCase() === 'POST' ? 'POST' : 'PRE';
     let intake: IntakeAnswers = {} as IntakeAnswers;
-    if (phase === 'PRE') {
+    {
+      // The same answers for both photos of a visit: the POST photo is the same wound minutes later.
       const t = await this.prisma.treatment.findFirst({
         where: { id: treatmentId, clinicId: ctx.clinicId },
         select: { case: { select: { location: true, comorbidities: true, woundType: true } }, phases: { where: { phaseType: 'PRE' }, select: { assessment: true } } },

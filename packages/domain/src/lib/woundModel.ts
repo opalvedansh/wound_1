@@ -59,13 +59,29 @@ export type IntakeAnswers = Record<string, string | number>;
 export interface AnalyzeResponse {
   status: AnalyzeStatus;
   case_id?: string;
+  /** pre: as found; post: after cleaning or debridement, before the dressing (same visit). */
+  phase?: PhotoPhase;
   timestamp?: string;
-  quality?: { ok: boolean; issues: string[] };
+  /** ok: no issue at all. usable: analysed (false only for a photo with nothing to analyse, i.e. a retake).
+   * warnings: what made a usable photo less reliable (low_resolution, blurry, dark, glare). */
+  quality?: { ok: boolean; usable?: boolean; issues: string[]; warnings?: string[] };
   marker_found?: boolean;
   flags?: Flag[];
   wound_type?: ClassResult;
   severity?: Record<string, ClassResult>;
   tissue_pct?: Record<string, number>;
+  /** The tissue mix when the model was unsure (below its confidence gate): shown, never used by the rules. */
+  tissue_pct_uncertain?: Record<string, number>;
+  tissue_confidence?: number;
+  /** One outline per tissue class, drawn in colour over the photo. */
+  tissue_outline?: Record<string, Outline> | null;
+  periwound_erythema_frac?: number;
+  periwound_maceration_frac?: number;
+  periwound_callus_frac?: number;
+  /** Classes the tissue model saw but is not yet trusted on (cross-validation): for the clinician to check. */
+  tissue_untrusted?: string[];
+  /** Per-channel gains from the sticker's grey patch; null when no patch was found. */
+  white_balance?: [number, number, number] | null;
   measurement?: Measurement | null;
   change?: AreaChange;
   outline?: Outline | null;
@@ -73,6 +89,135 @@ export interface AnalyzeResponse {
   follow_up_questions?: IntakeQuestion[];
   model_versions?: Record<string, string>;
 }
+
+export type PhotoPhase = 'pre' | 'post';
+
+// ---------------------------------------------------------------- treatment report (wound-ai/wound_ai/care.py)
+
+/** One analysed photo, reduced to what the treatment report needs (same as progress.observation in wound-ai). */
+export interface Observation {
+  taken_at: string;
+  status: string;
+  area_cm2: number | null;
+  length_cm: number | null;
+  width_cm: number | null;
+  perimeter_cm: number | null;
+  tissue_pct: Record<string, number> | null;
+  periwound_erythema_frac: number | null;
+  periwound_maceration_frac: number | null;
+  periwound_callus_frac: number | null;
+  flags: Flag[];
+}
+
+export const observation = (f: AnalyzeResponse, takenAt: string): Observation => ({
+  taken_at: takenAt,
+  status: f.status,
+  area_cm2: f.measurement?.area_cm2 ?? null,
+  length_cm: f.measurement?.length_cm ?? null,
+  width_cm: f.measurement?.width_cm ?? null,
+  perimeter_cm: f.measurement?.perimeter_cm ?? null,
+  tissue_pct: f.tissue_pct ?? null,
+  periwound_erythema_frac: f.periwound_erythema_frac ?? null,
+  periwound_maceration_frac: f.periwound_maceration_frac ?? null,
+  periwound_callus_frac: f.periwound_callus_frac ?? null,
+  flags: f.flags ?? [],
+});
+
+/** The clinician's assessment as the care rules read it (values are the app's own options). */
+export interface CareAssessment {
+  exudate_level?: string | null;
+  exudate_type?: string | null;
+  infection_signs?: string[];
+  edge_condition?: string | null;
+  periwound_condition?: string | null;
+  pain_level?: number | null;
+}
+
+export interface TreatmentInput {
+  sequence: number;
+  pre?: Observation | null;
+  post?: Observation | null;
+  assessment?: CareAssessment | null;
+  therapy?: string[];
+  dressing?: string | null;
+}
+
+export interface TreatmentReportRequest {
+  /** The PRE photo's class result. */
+  wound_type: ClassResult | null;
+  severity?: Record<string, ClassResult>;
+  intake: IntakeAnswers;
+  /** Visit order; the current treatment last. */
+  treatments: TreatmentInput[];
+}
+
+export type Trajectory = 'improving' | 'static' | 'deteriorating';
+
+export interface PhotoChange {
+  days: number | null;
+  area_before_cm2?: number;
+  area_after_cm2?: number;
+  /** Positive = smaller. */
+  percent_area_reduction?: number;
+  cm2_per_week?: number;
+  edge_advance_cm_per_week?: number;
+  nonviable_before_pct?: number;
+  nonviable_after_pct?: number;
+}
+
+export interface Progress {
+  /** What this visit's cleaning or debridement did (PRE → POST of the same visit). */
+  session: {
+    area_before_cm2?: number;
+    area_after_cm2?: number;
+    area_note?: string | null;
+    nonviable_before_pct?: number;
+    nonviable_after_pct?: number;
+    nonviable_removed_points?: number;
+  } | null;
+  /** Visit to visit, like with like: POST photos if this visit has one, else PRE photos. */
+  healing: {
+    phase: PhotoPhase;
+    n_photos: number;
+    /** The change treated as measurement noise, and where the figure comes from (a study, or the placeholder). */
+    noise_band?: { smaller_pct: number; larger_pct: number; source: string };
+    comparable: boolean;
+    reason?: string;
+    since_last?: PhotoChange;
+    since_first?: PhotoChange;
+    trajectory?: Trajectory | null;
+    basis?: 'area' | 'tissue' | null;
+    four_week?: { days: number; percent_area_reduction: number; target: number; on_track: boolean } | null;
+  };
+  push: { score: number; size: number; exudate: number; tissue: number; note: string } | null;
+  flags: Flag[];
+}
+
+export interface CareSuggestion {
+  rule_id: string;
+  domain: 'T' | 'I' | 'M' | 'E' | 'R';
+  /** One of the app's therapy or dressing options. */
+  action: string;
+  alternatives: string[];
+  text: string;
+  because: string[];
+}
+
+export interface Care {
+  suggestions: CareSuggestion[];
+  contraindications: { action: string; reason: string }[];
+  checks: { rule_id: string; text: string }[];
+}
+
+export interface TreatmentReportResponse extends Care {
+  progress: Progress;
+  flags: Flag[];
+  report_markdown: string;
+  rules_version: string;
+}
+
+/** What a reviewer decided about each suggestion, stored in the review's corrections. */
+export type SuggestionDecisions = Record<string, 'accepted' | 'declined'>;
 
 /** The model refuses an analysis without these (they decide the diabetic-foot rule and the follow-ups). */
 export const REQUIRED_INTAKE = ['diabetes', 'cause'] as const;

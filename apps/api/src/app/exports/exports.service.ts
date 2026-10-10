@@ -184,6 +184,8 @@ export class ExportsService {
       'model_wound_type', 'model_wound_type_prob', 'model_severity', 'model_tissue_pct', 'model_tissue_untrusted',
       'model_periwound_erythema_frac', 'model_periwound_maceration_frac', 'model_periwound_callus_frac', 'area_cm2',
       'review', 'corrections', 'model_versions', 'flags_version',
+      // Random ids, no identity: for wound-ai/scripts/export_for_labelling.py to fetch the photo with the clinic's key.
+      'visit_id', 'photo_path',
     ]);
     let after: string | undefined;
     for (;;) {
@@ -202,6 +204,7 @@ export class ExportsService {
           phase: {
             select: {
               assessment: true,
+              image: { select: { imageUrl: true } },
               treatment: {
                 select: {
                   sequence: true,
@@ -248,6 +251,8 @@ export class ExportsService {
           json(r.review?.corrections),
           json(r.modelVersions),
           f.flags_version,
+          r.id,
+          r.phase.image?.imageUrl,
         ]);
       }
       yield chunk;

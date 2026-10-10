@@ -41,6 +41,8 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 | `wound_ai/losses.py` | Partial-label losses: each image only teaches the tissue classes its dataset labels |
 | `scripts/build_severity_dataset.py` | Pressure-injury stage, burn depth and Wagner grade from 10 public datasets; augmented copies found by image content and kept in one fold, locked test from original-looking sources |
 | `scripts/severity_cv.py` | The three severity heads, 5-fold CV from the wound-type backbone; a head is installed only if it clears its test bar |
+| `scripts/export_for_labelling.py` | A batch of clinic photos for CVAT with the model's tissue outlines pre-filled (necrosis, redness, maceration first) |
+| `scripts/import_labels.py` | The clinician's corrected outlines back as tissue training rows; ~30% of clinic patients locked as a clinic test set |
 | `scripts/clinic_validation.py` | Model vs the nurse's own assessment on the clinic's visits (the portal's `validation` export), with 95% CIs |
 | `scripts/prepare_tissue.py` | Rewrite a tissue dataset's masks into this project's tissue classes (map file per dataset) |
 | `scripts/train_seg.py` | Wound boundary or tissue segmentation (resumable for Kaggle time limits) |
@@ -105,7 +107,8 @@ Severity (stage, burn depth, Wagner grade): `notebooks/kaggle_severity_cv.ipynb`
 unique, and only heads that clear their locked-test bar are installed.
 
 On the clinic's own patients: `docs/validation_study.md`, scored by `scripts/clinic_validation.py` from the portal's
-de-identified `validation` export.
+de-identified `validation` export. More tissue labels: `export_for_labelling.py` → correct in CVAT → `import_labels.py --merge` →
+`tissue_cv.py --manifest data/tissue_manifest_all.csv --teacher-only`.
 
 More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),
 deduplicated against each other and the locked test sets by `scripts/build_public_dataset.py`: about 4,820 photos

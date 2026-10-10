@@ -18,6 +18,7 @@ const visit = (overrides: Record<string, unknown> = {}) => ({
   },
   review: { corrections: { wound_type: 'pressure' } },
   phase: {
+    image: { imageUrl: 'k1/treatments/t2/pre.jpg' },
     assessment: {
       woundBedTissue: ['Granulation', 'Slough'],
       pressureStage: 'Stage 3',
@@ -59,7 +60,7 @@ describe('ExportsService validation dataset', () => {
     expect(header.split(',')).toEqual(expect.arrayContaining(['nurse_pressure_stage', 'model_severity', 'model_tissue_pct']));
     expect(row).toContain('P-007,c1,T2,2026-10,sacrum,Pressure Ulcer,Granulation;Slough,Stage 3,,,Erythematous,Rolled,Erythema;Malodor,Moderate,pressure,0.81');
     expect(row).toContain('stage_3');
-    expect(row).toContain('flags-0.1-unsigned');
+    expect(row.endsWith('flags-0.1-unsigned,r1,k1/treatments/t2/pre.jpg')).toBe(true);
     expect(audit.logNow).toHaveBeenCalledWith(expect.objectContaining({ action: 'export.validation', details: { deidentified: true } }));
   });
 

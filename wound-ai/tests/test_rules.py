@@ -55,6 +55,26 @@ def test_burns_on_several_areas_are_a_danger_sign():
     assert any("more than one body area" in t for t in texts(flags({"cause": "burn", "burn_other_sites": "yes"}), "urgent"))
 
 
+def test_burn_depth_full_thickness_is_urgent_partial_thickness_needs_review():
+    def depth(label):
+        return flags({"cause": "burn"}, severity={"burn_depth": {"label": label, "prob": 0.9}})
+
+    assert any("deep burn" in t for t in texts(depth("full_thickness"), "urgent"))
+    partial = depth("partial_thickness")
+    assert not any("deep burn" in t for t in texts(partial, "urgent"))
+    assert any("superficial or deep partial" in t for t in texts(partial, "review"))
+    assert not any("burn" in t.lower() and "depth" in t for t in texts(depth("superficial")))
+
+
+def test_deep_pressure_injury_stages_and_wagner_3_need_review():
+    for stage in ("stage_3", "stage_4", "unstageable", "deep_tissue_injury"):
+        assert any("pressure injury" in t for t in texts(flags({}, severity={"pu_stage": {"label": stage}}), "review")), stage
+    for stage in ("stage_1", "stage_2"):
+        assert not any("pressure injury" in t for t in texts(flags({}, severity={"pu_stage": {"label": stage}}))), stage
+    assert any("Wagner grade 3" in t for t in texts(flags({}, severity={"dfu_wagner": {"label": "grade_3"}}), "review"))
+    assert not any("Wagner" in t for t in texts(flags({}, severity={"dfu_wagner": {"label": "grade_2"}})))
+
+
 def test_report_leads_with_emergency_care_when_a_danger_sign_fires():
     report, _ = build_report({"intake": {"fever": "yes", "redness_spreading": "yes"}})
     assert report.splitlines()[3].startswith("**Emergency care now")

@@ -9,6 +9,7 @@ reported as 'not assessed', so you can ship modules as they become validated:
       wound_type.pt      wound type classifier        (train_cls.py --target wound_type)
       pu_stage.pt        pressure injury stage        (only applied to pressure injuries)
       burn_depth.pt      burn depth                   (only applied to burns)
+      dfu_wagner.pt      DFU Wagner grade 0-3         (only applied to diabetic foot ulcers)
       dfu_infection.pt   DFU infection/ischaemia      (only applied to diabetic foot ulcers)
 """
 from __future__ import annotations
@@ -26,9 +27,9 @@ from .intake import FOOT_SITES
 from .measure import area_change, find_marker, grey_patch_gains, measure_wound
 from .models import WoundClassifier, build_seg_model
 from .quality import check_quality
-from .report import build_report, red_flags
+from .report import FLAGS_VERSION, build_report, red_flags
 
-SEVERITY_HEADS = {"pu_stage": "pressure", "burn_depth": "burn", "dfu_infection": "diabetic"}
+SEVERITY_HEADS = {"pu_stage": "pressure", "burn_depth": "burn", "dfu_wagner": "diabetic", "dfu_infection": "diabetic"}
 # Mean tissue-model confidence over the wound bed below which the tissue mix is reported as uncertain and not used
 # by the healing or care rules. PLACEHOLDER: set from validation (confidence against accuracy on held-out photos).
 TISSUE_MIN_CONFIDENCE = 0.6
@@ -275,6 +276,7 @@ class WoundAnalyzer:
             f["change"] = area_change(f["measurement"]["area_cm2"], previous["area_cm2"], previous.get("days_ago"))
 
         f["flags"] = red_flags(f)
+        f["flags_version"] = FLAGS_VERSION
         llm_text = None
         if self.llm is not None:
             from PIL import Image

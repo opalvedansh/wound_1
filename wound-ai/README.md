@@ -39,6 +39,9 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 | `scripts/pseudo_label.py` | A trained tissue model labels unlabelled photos where it is confident (semi-supervised training) |
 | `scripts/tissue_cv.py` | Tissue model: per fold teacher → pseudo-labels → student, scored on the locked test set against clinician agreement |
 | `wound_ai/losses.py` | Partial-label losses: each image only teaches the tissue classes its dataset labels |
+| `scripts/build_severity_dataset.py` | Pressure-injury stage, burn depth and Wagner grade from 10 public datasets; augmented copies found by image content and kept in one fold, locked test from original-looking sources |
+| `scripts/severity_cv.py` | The three severity heads, 5-fold CV from the wound-type backbone; a head is installed only if it clears its test bar |
+| `scripts/clinic_validation.py` | Model vs the nurse's own assessment on the clinic's visits (the portal's `validation` export), with 95% CIs |
 | `scripts/prepare_tissue.py` | Rewrite a tissue dataset's masks into this project's tissue classes (map file per dataset) |
 | `scripts/train_seg.py` | Wound boundary or tissue segmentation (resumable for Kaggle time limits) |
 | `scripts/train_cls.py` | Any label column (wound type, PU stage, burn depth, DFU infection) + calibration |
@@ -49,6 +52,7 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 | `scripts/smoke_test.py` | Synthetic end-to-end test of every piece (CPU, under a minute) |
 | `docs/roadmap.md` | The full roadmap and build guide: architecture, data, training, evaluation, regulation |
 | `docs/30_day_build_plan.md` | Day-by-day plan for the first month, from setup to the app integration |
+| `docs/validation_study.md` | Protocol for validating the model on the clinic's own patients |
 | `docs/wound_flowcharts.md` | Wound classification flowcharts (Mermaid) = the labelling scheme; PNG copies in `docs/img/` |
 | `api/server.py` | FastAPI backend for your Next.js front end |
 
@@ -95,6 +99,13 @@ publicly (DFUTissue, LUTSeg, WoundTissue). The notebook trains on those only (`-
 run (a teacher pseudo-labelling ~11,400 other photos, `link_kaggle_inputs.py --set pool`, and a student learning from
 both) was worse in 2 of 3 folds. More human labels, especially of necrosis (17 photos), are what will help. Classes are scored against how well five clinicians agree with
 each other (LUTSeg's gold standard), and the app uses only the classes that come close (`trusted_classes`).
+
+Severity (stage, burn depth, Wagner grade): `notebooks/kaggle_severity_cv.ipynb` (runs `build_severity_dataset.py` and
+`severity_cv.py`). About 16,000 public photos, many of them augmented copies of each other: the log shows how many are
+unique, and only heads that clear their locked-test bar are installed.
+
+On the clinic's own patients: `docs/validation_study.md`, scored by `scripts/clinic_validation.py` from the portal's
+de-identified `validation` export.
 
 More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),
 deduplicated against each other and the locked test sets by `scripts/build_public_dataset.py`: about 4,820 photos

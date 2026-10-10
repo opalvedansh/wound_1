@@ -162,7 +162,7 @@ def in_parallel(jobs: list[tuple[str, list[str], Path, Path]], gpus: int, quiet:
 
 
 def mean_sd(values: list[float]) -> dict:
-    vals = [v for v in values if v is not None]
+    vals = [v for v in values if v is not None and not math.isnan(v)]  # NaN: e.g. AUROC of a one-class test set
     if not vals:
         return {"mean": None, "sd": None}
     return {"mean": round(statistics.mean(vals), 4), "sd": round(statistics.stdev(vals), 4) if len(vals) > 1 else 0.0}

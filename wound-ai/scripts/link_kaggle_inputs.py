@@ -8,6 +8,7 @@ Datasets attached to the Kaggle notebook as inputs are linked; any that aren't a
     python scripts/link_kaggle_inputs.py --input-root X  # anywhere else
     python scripts/link_kaggle_inputs.py --set tissue    # the tissue dataset, into data/raw/tissue/
     python scripts/link_kaggle_inputs.py --set pool      # extra unlabelled wound photos, into data/raw/pool/
+    python scripts/link_kaggle_inputs.py --set severity  # stage/depth/grade-labelled photos, into data/raw/severity/
 
 The datasets:
 """
@@ -37,9 +38,15 @@ POOL_DATASETS = {
     "abdulazizalghaili/postoperative-wound-infection": "abdulazizalghaili_postoperative-wound-infection",  # 380 surgical
     "mohamadtaher/wound-data": "mohamadtaher_wound-data",  # FUSeg incl. its 200 challenge-test photos
 }
+# Pressure-injury stage, burn depth and Wagner grade labels (build_severity_dataset.py; it also reads two public sets).
+SEVERITY_DATASETS = {ref: ref.replace("/", "_") for ref in (
+    "faresabbasai2022/burn-dataset", "faresabbasai2022/burn-dataset13", "mohammaddimasnoufal/skin-burn-dataset",
+    "nomi6677/skin-burn-classification-with-degrees", "divyanshmahajan2311/pressure-ulcer-stagewise",
+    "divyanshmahajan2311/corrected-ulcer-dataset", "gursahiba/final-ulcer-dataset",
+    "purushomohan/dfu-wagners-classification")}
 SETS = {"public": (DATASETS, "data/raw/public"), "tissue": (TISSUE_DATASETS, "data/raw/tissue"),
-        "pool": (POOL_DATASETS, "data/raw/pool")}
-__doc__ += "".join(f"\n    {ref}" for ref in [*DATASETS, *TISSUE_DATASETS, *POOL_DATASETS])
+        "pool": (POOL_DATASETS, "data/raw/pool"), "severity": (SEVERITY_DATASETS, "data/raw/severity")}
+__doc__ += "".join(f"\n    {ref}" for ref in [*DATASETS, *TISSUE_DATASETS, *POOL_DATASETS, *SEVERITY_DATASETS])
 
 
 def find(root: Path, ref: str) -> Path | None:

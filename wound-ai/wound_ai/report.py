@@ -22,6 +22,8 @@ from .progress import FOUR_WEEK_TARGET, FOUR_WEEK_WINDOW, progress_flags, trajec
 DISCLAIMER = ("AI-generated draft for review by a qualified clinician. It is not a diagnosis and must not be used "
               "to start, stop or change treatment without clinical assessment.")
 
+# The red-flag rules' version (docs/clinical_signoff.md section 5): "-unsigned" until a clinician signs them off.
+FLAGS_VERSION = "flags-0.1-unsigned"
 UNCERTAIN_BELOW = 0.70  # calibrated probability below which a classification is reported as uncertain
 ABPI_LOW = 0.8  # below: arterial or mixed disease possible (guidelines differ; clinician sets the threshold)
 ABPI_HIGH = 1.3  # above: arteries may be calcified, so the reading can be falsely reassuring
@@ -70,8 +72,11 @@ def red_flags(f: dict) -> list[dict]:
             add("urgent", f"{DANGER}: burn on the face, neck, hands or feet: refer to a burns unit.")
         if a.get("burn_other_sites") == "yes":
             add("urgent", f"{DANGER}: burns on more than one body area: estimate the total area and refer to a burns unit.")
-        if sev.get("burn_depth", {}).get("label") in ("deep_partial", "full_thickness"):
+        depth = sev.get("burn_depth", {}).get("label")
+        if depth in ("deep_partial", "full_thickness"):
             add("urgent", "Possible deep burn: burns specialist assessment.")
+        elif depth == "partial_thickness":  # the public training labels can't tell superficial from deep partial
+            add("review", "Possible partial-thickness burn: assess the depth (superficial or deep partial) on examination.")
 
     # Charts 2 and 3: a photo cannot show blood flow, so leg and foot ulcers say so until a clinician enters an ABPI.
     acute = a.get("cause") in ("burn", "surgery", "injury_cut_or_fall")
@@ -86,6 +91,13 @@ def red_flags(f: dict) -> list[dict]:
         elif abpi > ABPI_HIGH:
             add("review", f"ABPI {abpi} is above {ABPI_HIGH}: arteries may be calcified (common in diabetes and kidney "
                           "disease), so the reading can be falsely reassuring. Check toe pressures.")
+    stage = sev.get("pu_stage", {}).get("label")
+    if stage in ("stage_3", "stage_4", "unstageable", "deep_tissue_injury"):
+        add("review", f"Possible {stage.replace('_', ' ')} pressure injury: confirm the stage on examination and "
+                      "review pressure relief.")
+    if sev.get("dfu_wagner", {}).get("label") == "grade_3":
+        add("review", "Possible Wagner grade 3 ulcer (deep, abscess or bone involvement): diabetic foot team review "
+                      "this week; probe to bone on examination.")
     if a.get("wound_opening") == "yes":
         add("review", "Surgical wound reported as opening: contact the operating team.")
     pct = chg.get("percent_area_reduction")
@@ -122,6 +134,10 @@ def has_danger_signs(flags: list[dict]) -> bool:
 
 
 # --------------------------------------------------------------------------- template report
+
+SEVERITY_NAMES = {"pu_stage": "Pressure injury stage", "burn_depth": "Burn depth", "dfu_wagner": "Wagner grade",
+                  "dfu_infection": "Infection/ischaemia"}
+
 
 def _fmt_class(entry: dict | None) -> str:
     if not entry:
@@ -188,7 +204,7 @@ def render_report(f: dict, narrative: str | None = None) -> str:
     lines += ["", "## Summary", narrative or template_narrative(f), "", "## Findings",
               f"- Wound type: {_fmt_class(f.get('wound_type'))}"]
     for k, v in (f.get("severity") or {}).items():
-        lines.append(f"- {k.replace('_', ' ').capitalize()}: {_fmt_class(v)}")
+        lines.append(f"- {SEVERITY_NAMES.get(k, k)}: {_fmt_class(v)}")
     if m:
         lines.append(f"- Size: area {m['area_cm2']} cm², length {m['length_cm']} cm, width {m['width_cm']} cm, "
                      f"perimeter {m['perimeter_cm']} cm ({m['n_regions']} region(s)). Depth not measurable from a photo.")
@@ -336,7 +352,7 @@ def render_treatment_report(req: dict, prog: dict, care: dict, flags: list[dict]
     lines += ["", "## Summary", narrative or treatment_narrative(prog, care), "",
               "## Findings", f"- Wound type: {_fmt_class(req.get('wound_type'))}"]
     for k, v in (req.get("severity") or {}).items():
-        lines.append(f"- {k.replace('_', ' ').capitalize()}: {_fmt_class(v)}")
+        lines.append(f"- {SEVERITY_NAMES.get(k, k)}: {_fmt_class(v)}")
     for name, obs in (("Before treatment", cur.get("pre")), ("After cleaning", cur.get("post"))):
         if not obs:
             continue

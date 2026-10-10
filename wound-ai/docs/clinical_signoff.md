@@ -1,6 +1,6 @@
-# Clinical sign-off: care suggestions and healing thresholds
+# Clinical sign-off: care suggestions, healing thresholds and red flags
 
-**Rules under review:** `care-0.1-unsigned` (wound_ai/care.py, wound_ai/progress.py, wound_ai/pipeline.py)
+**Rules under review:** `care-0.1-unsigned` (wound_ai/care.py, wound_ai/progress.py, wound_ai/pipeline.py) and `flags-0.1-unsigned` (wound_ai/report.py)
 **Reviewer:** a clinician responsible for wound care at the deploying clinic
 
 ## What you are signing off
@@ -92,12 +92,51 @@ Healing compares **like with like**: after-cleaning photo with after-cleaning ph
 | H10 | **Which tissue types the app may use** | Only classes whose cross-validated test Dice reaches 80% of the clinician-to-clinician Dice on the same photos (LUTSeg gold standard; 0.5 where no clinician figure exists), with at least 15 training and 10 test photos. Others are shown only as "possibly also: …, check on examination" | ☐ Approve ☐ Change ratio to ___ |
 | H9 | **Tissue model confidence gate** | Tissue mix below 60% mean model confidence is shown as "uncertain" and not used by any rule | ☐ Approve ☐ Change to ___% |
 
-## 5. Sign-off
+## 5. Red flags and severity results (`wound_ai/report.py`, version `flags-0.1-unsigned`)
+
+Red flags appear at the top of every draft. **Urgent** flags starting "Danger sign" make the report open with
+"Emergency care now". Most flags come from the intake answers, not the photo.
+
+| ID | When | Level | Draft says | Decision |
+|---|---|---|---|---|
+| F1 | Foot cold, pale or toes darkening (intake) | Urgent, danger sign | "A cold, pale or darkening foot or toes (possible gangrene or critical ischaemia): same-day vascular or diabetic foot team." | ☐ Approve ☐ Change ☐ Remove |
+| F2 | Diabetes **and** necrosis in the tissue mix. *Note: the tissue model is not yet trusted on necrosis, so today this only fires from F1's intake answer.* | Urgent, danger sign | "Dark/necrotic tissue in a person with diabetes: same-day assessment by a diabetic foot or vascular team." | ☐ Approve ☐ Change ☐ Remove |
+| F3 | Fever **and** (spreading redness **or** thick yellow/green discharge) | Urgent, danger sign | "Fever with spreading redness or pus: possible spreading infection, needs urgent medical review." | ☐ Approve ☐ Change ☐ Remove |
+| F4 | Spreading redness without fever | Review | "Redness or swelling reported as spreading: clinician review within 24 hours." | ☐ Approve ☐ Change ☐ Remove |
+| F5 | Burn, chemical or electrical | Urgent, danger sign | "Refer to a burns unit; surface appearance can underestimate damage." | ☐ Approve ☐ Change ☐ Remove |
+| F6 | Burn on face, neck, hands or feet | Urgent, danger sign | "Refer to a burns unit." | ☐ Approve ☐ Change ☐ Remove |
+| F7 | Burns on more than one body area | Urgent, danger sign | "Estimate the total area and refer to a burns unit." | ☐ Approve ☐ Change ☐ Remove |
+| F8 | Burn-depth model says **full thickness** | Urgent | "Possible deep burn: burns specialist assessment." | ☐ Approve ☐ Change ☐ Remove |
+| F9 | Burn-depth model says **partial thickness** (the public training data can't tell superficial from deep partial) | Review | "Possible partial-thickness burn: assess the depth (superficial or deep partial) on examination." | ☐ Approve ☐ Change ☐ Remove |
+| F10 | Leg or foot ulcer (not an acute wound), ABPI not entered | Review | "Blood flow not assessed: check foot pulses and ABPI before any compression." | ☐ Approve ☐ Change ☐ Remove |
+| F11 | ABPI below 0.8 (1.5) | Urgent | "Arterial or mixed disease possible. Vascular review before any compression." | ☐ Approve ☐ Change ☐ Remove |
+| F12 | ABPI above 1.3 (1.5) | Review | "Arteries may be calcified … Check toe pressures." | ☐ Approve ☐ Change ☐ Remove |
+| F13 | Pressure-stage model says **stage 3, stage 4, unstageable or deep tissue injury** | Review | "Possible … pressure injury: confirm the stage on examination and review pressure relief." | ☐ Approve ☐ Change level to ___ ☐ Remove |
+| F14 | Wagner model says **grade 3** | Review | "Possible Wagner grade 3 ulcer (deep, abscess or bone involvement): diabetic foot team review this week; probe to bone on examination." | ☐ Approve ☐ Change level to ___ ☐ Remove |
+| F15 | Surgical wound reported as opening | Review | "Contact the operating team." | ☐ Approve ☐ Change ☐ Remove |
+| F16 | Possible exposed bone or tendon in the tissue mix | Review | "Confirm on examination (risk of bone infection)." | ☐ Approve ☐ Change ☐ Remove |
+| F17 | Wound-type model below 70% confidence | Review | "Model is uncertain about the wound type: clinician to classify." | ☐ Approve ☐ Change threshold to ___% |
+| F18 | No calibration sticker, or no wound found | Review | "Size not measured." | ☐ Approve ☐ Change ☐ Remove |
+| F19 | Photo blurry, dark, glare or low resolution | Review | "Photo quality (…): the outline, size and tissue estimates may be less accurate." | ☐ Approve ☐ Change ☐ Remove |
+
+**Severity results shown in the draft** (pressure-injury stage, burn depth, Wagner grade 0–3). Each is shown only for
+its wound type and only if its cross-validated test macro-F1 reaches the bar below; under 70% confidence it is shown
+as "uncertain" with the alternatives. Wagner grades 4–5 (gangrene) are not in the training data: F1 covers them.
+
+| # | Item | Current value | Decision |
+|---|---|---|---|
+| S1 | Bar for showing a severity result at all | Mean test macro-F1 ≥ 0.60 over the folds | ☐ Approve ☐ Change to ___ |
+| S2 | Burn depth classes | Superficial / partial thickness / full thickness | ☐ Approve ☐ Change |
+| S3 | Pressure-injury classes | Stage 1–4, unstageable (deep tissue injury: too few public photos, not predicted) | ☐ Approve ☐ Change |
+
+Missing red flags (e.g. signs of sepsis, uncontrolled pain, bleeding): ____________________________________________
+
+## 6. Sign-off
 
 When every box above is ticked, the developer:
 
 1. applies the changes;
-2. sets the rules version to `care-1.0`;
+2. sets the rules versions to `care-1.0` and `flags-1.0`;
 3. adds a test for each changed rule;
 4. records the sign-off below.
 

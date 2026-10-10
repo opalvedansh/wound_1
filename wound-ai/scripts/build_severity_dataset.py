@@ -194,6 +194,10 @@ def main():
             n = max(1, round(a.test_frac * len(lab)))
             test_groups += rng.choice(lab.index.to_numpy(), size=min(n, len(lab)), replace=False).tolist()
         d["split"] = np.where(d.group.isin(test_groups), "test", "train")
+        # One photo per test group (an original-source one): copies would inflate the test count and narrow the CIs.
+        rank = (~d.source.isin(TEST_SOURCES)).astype(int)
+        extra = (d.split == "test") & d.assign(rank=rank).sort_values("rank").duplicated("group").reindex(d.index)
+        d, e = d[~extra].reset_index(drop=True), e[~extra.to_numpy()]
         is_test = (d.split == "test").to_numpy()
         sim_to_test = nearest(e, e[is_test])
         near = ~is_test & (sim_to_test >= a.guard_sim)

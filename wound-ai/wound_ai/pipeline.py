@@ -257,7 +257,8 @@ class WoundAnalyzer:
         wt = (f.get("wound_type") or {}).get("label")
         f["severity"] = {}
         for head, applies_to in SEVERITY_HEADS.items():
-            if head in self.cls and wt == applies_to:
+            # A burn the intake reports is a burn, whatever the photo looks like (deep burns can pass for ulcers).
+            if head in self.cls and (wt == applies_to or (applies_to == "burn" and intake.get("cause") == "burn")):
                 f["severity"][head] = self._classify(img, head, intake)
 
         if "tissue" in self.seg and mask is not None:

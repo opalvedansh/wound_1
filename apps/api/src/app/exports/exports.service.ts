@@ -25,7 +25,21 @@ const ageOf = (dob: Date | null, ageYears: number | null, now = new Date()) => {
   return age;
 };
 
-export type Dataset = 'patients' | 'visits';
+export type Dataset = 'patients' | 'visits' | 'validation';
+
+const joined = (values: string[] | null | undefined) => (values ?? []).join(';');
+const json = (value: unknown) => (value === null || value === undefined ? '' : JSON.stringify(value));
+
+type ModelFindings = {
+  wound_type?: { label?: string; prob?: number };
+  severity?: Record<string, { label?: string; prob?: number }>;
+  tissue_pct?: Record<string, number>;
+  tissue_untrusted?: string[];
+  periwound_erythema_frac?: number;
+  periwound_maceration_frac?: number;
+  periwound_callus_frac?: number;
+  flags_version?: string;
+};
 
 /**
  * CSV exports, streamed in batches with keyset pagination, so a clinic of any size exports in constant memory.
@@ -40,9 +54,15 @@ export class ExportsService {
   ) {}
 
   async *stream(ctx: ClinicContext, dataset: string, deidentify: boolean): AsyncGenerator<string> {
-    if (dataset !== 'patients' && dataset !== 'visits') throw new BadRequestException('Unknown dataset. Use "patients" or "visits".');
-    await this.audit.logNow({ clinicId: ctx.clinicId, userId: ctx.userId, action: `export.${dataset}`, details: { deidentified: deidentify } });
-    yield* dataset === 'patients' ? this.patients(ctx, deidentify) : this.visits(ctx, deidentify);
+    if (dataset !== 'patients' && dataset !== 'visits' && dataset !== 'validation') {
+      throw new BadRequestException('Unknown dataset. Use "patients", "visits" or "validation".');
+    }
+    // The validation set is for scoring the model outside the clinic: always de-identified.
+    const deid = dataset === 'validation' || deidentify;
+    await this.audit.logNow({ clinicId: ctx.clinicId, userId: ctx.userId, action: `export.${dataset}`, details: { deidentified: deid } });
+    if (dataset === 'patients') yield* this.patients(ctx, deid);
+    else if (dataset === 'visits') yield* this.visits(ctx, deid);
+    else yield* this.validation(ctx);
   }
 
   private async *patients(ctx: ClinicContext, deid: boolean): AsyncGenerator<string> {
@@ -145,6 +165,89 @@ export class ExportsService {
           r.flagCount,
           r.reviewStatus,
           r.modelVersions ? JSON.stringify(r.modelVersions) : '',
+        ]);
+      }
+      yield chunk;
+      after = rows[rows.length - 1].id;
+    }
+  }
+  /**
+   * One row per analysed visit: the nurse's own assessment next to what the model found in the same (before-treatment)
+   * photo, and the clinician's review. wound-ai/scripts/clinic_validation.py scores the model from it.
+   * The nurse's wound type is the case's latest answer (a wound's type rarely changes between visits).
+   */
+  private async *validation(ctx: ClinicContext): AsyncGenerator<string> {
+    yield csvRow([
+      'patient_code', 'case_id', 'visit', 'visit_month', 'wound_location',
+      'nurse_wound_type', 'nurse_wound_bed_tissue', 'nurse_pressure_stage', 'nurse_burn_depth', 'nurse_wagner_grade',
+      'nurse_periwound', 'nurse_edge', 'nurse_infection_signs', 'nurse_exudate_level',
+      'model_wound_type', 'model_wound_type_prob', 'model_severity', 'model_tissue_pct', 'model_tissue_untrusted',
+      'model_periwound_erythema_frac', 'model_periwound_maceration_frac', 'model_periwound_callus_frac', 'area_cm2',
+      'review', 'corrections', 'model_versions', 'flags_version',
+    ]);
+    let after: string | undefined;
+    for (;;) {
+      const rows = await this.prisma.aIResult.findMany({
+        where: { clinicId: ctx.clinicId, status: 'ok', ...PRE_VISIT, ...(after ? { id: { gt: after } } : {}) },
+        orderBy: { id: 'asc' },
+        take: BATCH,
+        select: {
+          id: true,
+          createdAt: true,
+          area: true,
+          reviewStatus: true,
+          modelVersions: true,
+          findings: true,
+          review: { select: { corrections: true } },
+          phase: {
+            select: {
+              assessment: true,
+              treatment: {
+                select: {
+                  sequence: true,
+                  deletedAt: true,
+                  case: { select: { id: true, location: true, woundType: true, patient: { select: { patientId: true } } } },
+                },
+              },
+            },
+          },
+        },
+      });
+      if (rows.length === 0) return;
+      let chunk = '';
+      for (const r of rows) {
+        const t = r.phase.treatment;
+        if (t.deletedAt) continue;
+        const a = r.phase.assessment;
+        const f = (r.findings ?? {}) as ModelFindings;
+        chunk += csvRow([
+          t.case.patient.patientId,
+          t.case.id,
+          `T${t.sequence}`,
+          month(r.createdAt),
+          t.case.location,
+          t.case.woundType,
+          joined(a?.woundBedTissue),
+          a?.pressureStage,
+          a?.burnDepth,
+          a?.wagnerGrade,
+          a?.periwoundCondition,
+          a?.edgeCondition,
+          joined(a?.infectionSigns),
+          a?.exudateLevel,
+          f.wound_type?.label,
+          f.wound_type?.prob,
+          json(f.severity),
+          json(f.tissue_pct),
+          joined(f.tissue_untrusted),
+          f.periwound_erythema_frac,
+          f.periwound_maceration_frac,
+          f.periwound_callus_frac,
+          r.area,
+          r.reviewStatus,
+          json(r.review?.corrections),
+          json(r.modelVersions),
+          f.flags_version,
         ]);
       }
       yield chunk;

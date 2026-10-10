@@ -38,6 +38,11 @@ export interface BaselineAssessment {
   edgeCondition: string;
   periwoundCondition: string;
   comorbidities: string[];
+  /** Tissue the clinician sees in the wound bed. Missing on assessments made before the question existed. */
+  woundBedTissue?: string[];
+  pressureStage?: string;
+  burnDepth?: string;
+  wagnerGrade?: string;
   /** Answers to questions an admin added to the assessment form. */
   responses?: QuestionResponse[];
 }

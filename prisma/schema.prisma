@@ -186,6 +186,10 @@ model ClinicalAssessment {
   painLevel          Int
   edgeCondition      String?
   periwoundCondition String?
+  woundBedTissue     String[] @default([]) // tissue the clinician sees: the reference for the tissue model
+  pressureStage      String?
+  burnDepth          String?
+  wagnerGrade        String?
   trend              String? // Improving | Static | Deteriorating (revisits)
   responses          Json? // answers to admin-added questions
   createdAt          DateTime @default(now())

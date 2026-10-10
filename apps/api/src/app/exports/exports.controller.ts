@@ -14,7 +14,7 @@ export class ExportsController {
 
   @Get(':dataset')
   @Limit({ max: 10, windowSeconds: 3600, bucket: 'export' })
-  @ApiOperation({ summary: 'CSV of patients or visits, streamed. De-identified unless deidentify=false. Audited first.' })
+  @ApiOperation({ summary: 'CSV of patients, visits or validation (nurse assessment next to model findings), streamed. De-identified unless deidentify=false (validation: always). Audited first.' })
   async download(@Param('dataset') dataset: string, @Query('deidentify') deidentify: string | undefined, @Req() req: ClinicRequest, @Res() res: Response) {
     const deid = deidentify !== 'false';
     const rows = this.exports.stream(clinicCtx(req), dataset.replace(/\.csv$/, ''), deid);

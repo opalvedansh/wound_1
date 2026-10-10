@@ -64,6 +64,10 @@ const TreatmentRecord = z.object({
       edgeCondition: z.string().max(100).optional().default(''),
       periwoundCondition: z.string().max(100).optional().default(''),
       comorbidities: z.array(z.string().max(100)).max(30).optional().default([]),
+      woundBedTissue: z.array(z.string().max(100)).max(30).optional().default([]),
+      pressureStage: z.string().max(100).optional().default(''),
+      burnDepth: z.string().max(100).optional().default(''),
+      wagnerGrade: z.string().max(100).optional().default(''),
       woundAppearanceTrend: z.enum(['Improving', 'Static', 'Deteriorating']).optional(),
       responses: answers,
     })
@@ -352,6 +356,10 @@ export class SyncService {
           painLevel: a.pain ?? 0,
           edgeCondition: a.edgeCondition || null,
           periwoundCondition: a.periwoundCondition || null,
+          woundBedTissue: a.woundBedTissue,
+          pressureStage: a.pressureStage || null,
+          burnDepth: a.burnDepth || null,
+          wagnerGrade: a.wagnerGrade || null,
           trend: a.woundAppearanceTrend ?? null,
           responses: (a.responses ?? undefined) as Prisma.InputJsonValue | undefined,
         };
@@ -570,6 +578,10 @@ export class SyncService {
           edgeCondition: a.edgeCondition ?? '',
           periwoundCondition: a.periwoundCondition ?? '',
           comorbidities: t.case.comorbidities,
+          woundBedTissue: a.woundBedTissue,
+          pressureStage: a.pressureStage ?? '',
+          burnDepth: a.burnDepth ?? '',
+          wagnerGrade: a.wagnerGrade ?? '',
           ...(a.trend ? { woundAppearanceTrend: a.trend as RevisitAssessment['woundAppearanceTrend'] } : {}),
           ...(a.responses ? { responses: a.responses as unknown as RevisitAssessment['responses'] } : {}),
         }

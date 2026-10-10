@@ -22,6 +22,13 @@ import { fieldClass } from "../ui/field";
 
 const pct = (p: number) => `${Math.round(p * 100)}%`;
 
+const SEVERITY_NAMES: Record<string, string> = {
+  pu_stage: "Pressure injury stage",
+  burn_depth: "Burn depth",
+  dfu_wagner: "Wagner grade",
+  dfu_infection: "Infection/ischaemia",
+};
+
 /** Tissue layer colours: the colours clinicians already associate with each tissue. */
 export const TISSUE_COLOR: Record<string, string> = {
   granulation: "#e11d48",
@@ -475,7 +482,7 @@ export function VisitResult({ caseId, visit, canDelete = true }: { caseId: strin
   const findings: [string, string][] = [
     ["Wound type", classText(f.wound_type, woundTypeName)],
     ...Object.entries(f.severity ?? {}).map(([head, result]): [string, string] => [
-      head.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()),
+      SEVERITY_NAMES[head] ?? head.replace(/_/g, " "),
       classText(result, (label) => label.replace(/_/g, " ")),
     ]),
     [

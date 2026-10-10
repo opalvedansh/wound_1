@@ -1,0 +1,7 @@
+# Not part of the API build (railway up from the repo root deploys apps/api).
+woundmetrics/
+wound-ai/
+apps/mobile/
+docs/
+tmp/
+*.png

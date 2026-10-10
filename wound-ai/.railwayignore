@@ -1,0 +1,12 @@
+# The image only needs requirements.txt, wound_ai/ and api/. Weights live on the service's volume.
+data/
+checkpoints/
+runs/
+reports/
+labelling/
+notebooks/
+tests/
+docs/
+scripts/
+.venv/
+__pycache__/

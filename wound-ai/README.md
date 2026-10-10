@@ -91,9 +91,9 @@ Folder names above are examples; check each dataset's real layout after download
 Cross-validation instead of one split: `notebooks/kaggle_cv.ipynb` (runs `scripts/cv.py`, outline at 768 px).
 
 Tissue model: `notebooks/kaggle_tissue_cv.ipynb` (runs `scripts/tissue_cv.py`). Only ~265 tissue-labelled photos exist
-publicly (DFUTissue, LUTSeg, WoundTissue), so it is semi-supervised: a teacher labels a pool of ~11,400 other wound
-photos (the public datasets + DFUC2022 + post-operative wounds, deduplicated; `link_kaggle_inputs.py --set pool`) where
-it is confident and a student learns from both. Classes are scored against how well five clinicians agree with
+publicly (DFUTissue, LUTSeg, WoundTissue). The notebook trains on those only (`--teacher-only`, ~1 h): a semi-supervised
+run (a teacher pseudo-labelling ~11,400 other photos, `link_kaggle_inputs.py --set pool`, and a student learning from
+both) was worse in 2 of 3 folds. More human labels, especially of necrosis (17 photos), are what will help. Classes are scored against how well five clinicians agree with
 each other (LUTSeg's gold standard), and the app uses only the classes that come close (`trusted_classes`).
 
 More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),

@@ -8,6 +8,9 @@ Per fold (grouped by patient, balanced by dataset; the locked test set is never 
 Every kept model is scored on the locked test set (scripts/evaluate.py), and each class is compared with how well
 LUTSeg's five clinicians agree with each other on the same kind of photos.
 
+--teacher-only skips steps 2-3 (each fold keeps its teacher): on the first Kaggle run the students were worse than
+their teachers in 2 of 3 folds, so the pseudo-labels cost ~8 GPU hours for nothing.
+
 A short timed trial first projects the run time: --folds if they fit --budget-hours, else --fallback-folds. With
 several GPUs, folds run in parallel. Re-running the same command continues where it stopped.
 
@@ -68,6 +71,7 @@ def parse():
     p.add_argument("--trust-dice", type=float, default=0.5)
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--out", default="runs/tissue_cv")
+    p.add_argument("--teacher-only", action="store_true", help="no pseudo-labels, no student: each fold keeps its teacher")
     p.add_argument("--smoke", action="store_true", help="debug: tiny run (3 batches, 1 epoch, 20 pseudo photos)")
     return p.parse_args()
 
@@ -127,6 +131,8 @@ def projected_hours(a, folds: int, gpus: int, weights: list[float], n_pool: int,
     teacher = a.teacher_epochs * math.ceil(n_train / a.batch) * per_batch * 1.15  # + validation
     student = a.student_epochs * math.ceil((n_train + pseudo) / a.batch) * per_batch * 1.05
     label = n_unlabeled * PSEUDO_SECONDS_PER_PHOTO
+    if a.teacher_only:
+        student = label = 0
     hours = math.ceil(folds / max(1, gpus)) * (teacher + label + student) / 3600
     print(f"timing: {per_batch:.2f} s per batch at {a.size}px; {folds} folds on {max(1, gpus)} GPU(s) -> about "
           f"{hours:.1f} h (worst case: all epochs, no early stop)", flush=True)
@@ -148,7 +154,7 @@ def main():
     gpus = gpu_count()
     df = pd.read_csv(a.manifest)
     pool, test = df[df.split != "test"], df[df.split == "test"]
-    n_unlabeled = len(pd.read_csv(a.unlabeled))
+    n_unlabeled = 0 if a.teacher_only else len(pd.read_csv(a.unlabeled))
     if a.smoke:
         n_unlabeled = min(n_unlabeled, 20)
     train_photos, train_pixels = class_stats(pool)
@@ -187,20 +193,21 @@ def main():
                                   fd[f] / "teacher/.done") for f in range(folds)])
     if any(codes):
         sys.exit(f"teacher folds failed: {[i for i, c in enumerate(codes) if c]}. Run the same command again.")
-    codes, _ = stage("pseudo", [(f"pseudo-labels {f + 1}/{folds}",
-                                 [PY, "scripts/pseudo_label.py", "--teacher", str(fd[f] / "teacher/tissue.pt"),
-                                  "--boundary", a.boundary, "--unlabeled", a.unlabeled, "--out", str(fd[f] / "pseudo"),
-                                  "--threshold", str(a.threshold), "--drop", ",".join(rare),
-                                  *(["--max", "20"] if a.smoke else [])],
-                                 fd[f] / "pseudo/log.txt", fd[f] / "pseudo/.done") for f in range(folds)])
-    if any(codes):
-        sys.exit(f"pseudo-labelling failed: {[i for i, c in enumerate(codes) if c]}. Run the same command again.")
-    codes, _ = stage("student", [(f"student {f + 1}/{folds}", train_cmd(a, f, folds, fd[f] / "student", weights,
-                                  str(fd[f] / "teacher/tissue.pt"), 1 if a.smoke else a.student_epochs, a.student_patience,
-                                  ["--extra-train", str(fd[f] / "pseudo/pseudo.csv")]), fd[f] / "student/log.txt",
-                                  fd[f] / "student/.done") for f in range(folds)])
-    if any(codes):
-        sys.exit(f"student folds failed: {[i for i, c in enumerate(codes) if c]}. Run the same command again.")
+    if not a.teacher_only:
+        codes, _ = stage("pseudo", [(f"pseudo-labels {f + 1}/{folds}",
+                                     [PY, "scripts/pseudo_label.py", "--teacher", str(fd[f] / "teacher/tissue.pt"),
+                                      "--boundary", a.boundary, "--unlabeled", a.unlabeled, "--out", str(fd[f] / "pseudo"),
+                                      "--threshold", str(a.threshold), "--drop", ",".join(rare),
+                                      *(["--max", "20"] if a.smoke else [])],
+                                     fd[f] / "pseudo/log.txt", fd[f] / "pseudo/.done") for f in range(folds)])
+        if any(codes):
+            sys.exit(f"pseudo-labelling failed: {[i for i, c in enumerate(codes) if c]}. Run the same command again.")
+        codes, _ = stage("student", [(f"student {f + 1}/{folds}", train_cmd(a, f, folds, fd[f] / "student", weights,
+                                      str(fd[f] / "teacher/tissue.pt"), 1 if a.smoke else a.student_epochs, a.student_patience,
+                                      ["--extra-train", str(fd[f] / "pseudo/pseudo.csv")]), fd[f] / "student/log.txt",
+                                      fd[f] / "student/.done") for f in range(folds)])
+        if any(codes):
+            sys.exit(f"student folds failed: {[i for i, c in enumerate(codes) if c]}. Run the same command again.")
     print(f"training done in {(time.time() - t0) / 3600:.1f} h; scoring the kept model of each fold on the locked test set",
           flush=True)
 
@@ -249,7 +256,7 @@ def main():
     def fmt(ms):
         return "—" if ms["mean"] is None else f"{ms['mean']:.3f} ± {ms['sd']:.3f}"
 
-    md = [f"# Tissue model: {folds}-fold cross-validation, semi-supervised", "",
+    md = [f"# Tissue model: {folds}-fold cross-validation, {'teachers only' if a.teacher_only else 'semi-supervised'}", "",
           "Locked test: LUTSeg gold-standard patients + DFUTissue Test. Each class is scored only on photos whose "
           "dataset labels it. Clinicians = Dice between LUTSeg's five clinicians on the same kind of photos.", "",
           "| Class | Train photos | Test photos | Test Dice (mean ± sd over folds) | Clinicians | Bar | Trusted |",
@@ -260,8 +267,9 @@ def main():
                   f"{'yes' if v['trusted'] else 'no'} |")
     md += ["", "| Fold | Teacher val Dice | Student val Dice | Kept | Pseudo-labelled photos | Non-viable error (points) |",
            "| --- | --- | --- | --- | --- | --- |"]
-    md += [f"| {r['fold'] + 1} | {r['teacher_val_dice'] or 0:.3f} | {r['student_val_dice'] or 0:.3f} | {r['kept']} | "
-           f"{r['pseudo_labelled']} | {r['test_nonviable_error'] if r['test_nonviable_error'] is not None else '—'} |"
+    dash = lambda x, f="{}": "—" if x is None else f.format(x)  # noqa: E731
+    md += [f"| {r['fold'] + 1} | {dash(r['teacher_val_dice'], '{:.3f}')} | {dash(r['student_val_dice'], '{:.3f}')} | "
+           f"{r['kept']} | {dash(r['pseudo_labelled'])} | {dash(r['test_nonviable_error'], '{:.1f}')} |"
            for r in folds_out]
     md += ["", f"Installed model: fold {best['fold'] + 1} ({best['kept']}), trusted on: {', '.join(trusted) or 'none'}."]
     (out / "summary.md").write_text("\n".join(md) + "\n")

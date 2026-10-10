@@ -100,6 +100,20 @@ describe('TreatmentReportService.run', () => {
     expect(summary.refreshCase).toHaveBeenCalledWith('c1');
   });
 
+  it("dates each photo by when the phone took it, and passes on the depth the clinician probed", async () => {
+    // Both photos reached the server on day 20, but the phone took them on days 7 and 16.
+    const row = treatment(1, result('v1', 20, 9), result('v1-post', 20, 6, { reviewStatus: 'included' }), { exudateLevel: 'Scant', infectionSigns: [], painLevel: 0, depthCm: 0.8 });
+    Object.assign(row.phases[0], { image: { takenAt: at(7) } });
+    Object.assign(row.phases[1], { image: { takenAt: at(16) } });
+    const { service, model } = setup([row]);
+    await service.run('t1', 'post');
+
+    const req = (model.treatmentReport.mock.calls[0] as unknown as [{ treatments: { pre: { taken_at: string }; post: { taken_at: string }; assessment: { depth_cm: number } }[] }])[0];
+    expect(req.treatments[0].pre.taken_at).toBe(at(7).toISOString());
+    expect(req.treatments[0].post.taken_at).toBe(at(16).toISOString());
+    expect(req.treatments[0].assessment.depth_cm).toBe(0.8);
+  });
+
   it('waits for the PRE photo: the report is its draft', async () => {
     const { service, model } = setup([treatment(1, result('v1', 0, 10, { status: 'processing' }))]);
     await service.run('t1', 'post');

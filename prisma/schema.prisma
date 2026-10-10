@@ -190,6 +190,7 @@ model ClinicalAssessment {
   pressureStage      String?
   burnDepth          String?
   wagnerGrade        String?
+  depthCm            Float? // probed by the clinician: a photo cannot show depth
   trend              String? // Improving | Static | Deteriorating (revisits)
   responses          Json? // answers to admin-added questions
   createdAt          DateTime @default(now())
@@ -203,6 +204,7 @@ model Image {
   imageUrl  String // storage path of the full photo
   thumbPath String? // storage path of the 320 px thumbnail
   sha256    String? // of the photo's bytes: the same photo is never analysed twice for one wound
+  takenAt   DateTime? // when the phone took it (it may upload later); null for portal uploads
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }

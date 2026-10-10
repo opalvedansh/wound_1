@@ -41,6 +41,39 @@ def test_healing_compares_post_with_post_never_pre_with_post():
     assert h["since_last"]["edge_advance_cm_per_week"] == 0.25
 
 
+def test_post_photo_days_later_is_the_response_to_the_treatment():
+    t1 = {"pre": obs(0, 10.0)}
+    t2 = {"pre": obs(7, 9.0), "post": obs(16, 6.0)}  # the post photo 9 days after the pre photo
+    p = progress([t1, t2], "venous")
+    assert p["session"] is None  # not a cleaning effect
+    r = p["response"]
+    assert r["days"] == 9.0 and r["percent_area_reduction"] == 33.3 and r["trajectory"] == "improving"
+    h = p["healing"]
+    assert h["phase"] == "pre" and h["n_photos"] == 3  # the later photo joins the as-found series
+    assert h["since_last"]["percent_area_reduction"] == 33.3 and h["since_first"]["percent_area_reduction"] == 40.0
+    worse = progress([t1, {"pre": obs(7, 9.0), "post": obs(16, 12.0)}], "venous")
+    assert worse["response"]["trajectory"] == "deteriorating"
+    assert any("increased" in f["text"] for f in worse["flags"])
+
+
+def test_same_visit_post_photo_is_never_a_response():
+    p = progress([{"pre": obs(0, 9.0), "post": obs(0, 10.0)}], "venous")
+    assert p["response"] is None and p["session"]["area_after_cm2"] == 10.0
+
+
+def test_first_after_cleaning_photo_falls_back_to_the_as_found_photos():
+    h = healing([{"pre": obs(0, 10.0)}, {"pre": obs(7, 6.0), "post": obs(7, 7.0)}])
+    assert h["phase"] == "pre" and h["since_last"]["percent_area_reduction"] == 40.0  # 10 -> 6, never 10 -> 7
+
+
+def test_depth_is_the_clinicians_and_shown_beside_the_last_one():
+    ts = [{"pre": obs(0, 10.0), "assessment": {"depth_cm": 1.2}}, {"pre": obs(7, 9.0), "assessment": {}},
+          {"pre": obs(14, 8.0), "assessment": {"depth_cm": 0.8}}]
+    assert progress(ts)["depth"] == {"depth_cm": 0.8, "previous_cm": 1.2}
+    assert progress(ts[:1])["depth"] == {"depth_cm": 1.2}
+    assert progress(ts[:2])["depth"] is None  # not probed at this visit
+
+
 def test_without_a_post_photo_the_pre_series_is_used():
     h = healing([{"pre": obs(0, 10.0)}, {"pre": obs(7, 6.0), "post": obs(7, status="retake")}])
     assert h["phase"] == "pre" and h["since_last"]["percent_area_reduction"] == 40.0

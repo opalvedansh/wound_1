@@ -1,4 +1,5 @@
 import type { QuestionResponse } from './questions';
+import type { PhotoFindings, Progress } from './woundModel';
 
 export type SyncState = 'synced' | 'pending';
 
@@ -43,6 +44,8 @@ export interface BaselineAssessment {
   pressureStage?: string;
   burnDepth?: string;
   wagnerGrade?: string;
+  /** The wound's depth in cm, probed by the clinician: a photo cannot show it. */
+  depthCm?: number;
   /** Answers to questions an admin added to the assessment form. */
   responses?: QuestionResponse[];
 }
@@ -61,9 +64,13 @@ export interface TherapyDetails {
 
 export interface ImageMetadata {
   captureTimestamp: string;
+  /** When each photo was taken: tells a post photo from the same visit from one taken days later. */
+  takenAt?: { pre?: string; post?: string };
   lightingScore?: number;
   blurScore?: number;
   calibrated: boolean;
+  /** The wound's longest length by ruler, typed in for a photo that has no sticker or phone reading to measure with. */
+  measuredLengthCm?: { pre?: number; post?: number };
 }
 
 export interface Case {
@@ -100,6 +107,14 @@ export interface TreatmentRemote {
     areaReductionSinceFirstPct?: number | null;
     /** Care suggestions, only once a clinician approved or edited the draft. */
     suggestions?: { action: string; text: string }[] | null;
+    /** What the model found in each photo (no outlines); the post photo's once it is analysed. */
+    findings?: PhotoFindings | null;
+    postFindings?: PhotoFindings | null;
+    /** When each photo was taken. */
+    takenAt?: string | null;
+    postTakenAt?: string | null;
+    /** Healing, what the session did and the response to the treatment (wound-ai /treatment-report). */
+    progress?: Progress | null;
   } | null;
 }
 

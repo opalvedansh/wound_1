@@ -72,8 +72,11 @@ const photosToSend = (t: Treatment, outboxHas: boolean) => {
   return out;
 };
 
-async function uploadPhoto(treatmentId: string, phase: 'pre' | 'post', uri: string): Promise<void> {
+async function uploadPhoto(treatmentId: string, phase: 'pre' | 'post', uri: string, measuredLengthCm?: number, takenAt?: string): Promise<void> {
   const form = new FormData();
+  if (measuredLengthCm !== undefined) form.append('measured_length_cm', String(measuredLengthCm));
+  // When the photo was taken, which can be long before it uploads.
+  if (takenAt) form.append('taken_at', takenAt);
   if (Platform.OS === 'web') {
     form.append('photo', await (await fetch(uri)).blob(), `${phase}.jpg`);
   } else {
@@ -89,7 +92,7 @@ async function sendPhotos(): Promise<void> {
     for (const { phase, uri } of photosToSend(t, !!s.outbox.treatments[t.id])) {
       const key = `${t.id}:${phase}`;
       try {
-        await uploadPhoto(t.id, phase, uri);
+        await uploadPhoto(t.id, phase, uri, t.imageMetadata?.measuredLengthCm?.[phase], t.imageMetadata?.takenAt?.[phase]);
         const now = store();
         const failures = { ...now.failures };
         delete failures[key];

@@ -23,6 +23,15 @@ export class VisitsController {
     return this.visits.followUps(body);
   }
 
+  @Post('model/photo-check')
+  @Limit({ max: 30, windowSeconds: 60, bucket: 'upload' })
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({ summary: "A photo's quality and whether the calibration sticker is in it, before it is used. Nothing is stored." })
+  @UseInterceptors(FileInterceptor('photo', { limits: { fileSize: MAX_PHOTO_BYTES, files: 1 } }))
+  photoCheck(@UploadedFile() photo: PhotoUpload | undefined) {
+    return this.visits.photoCheck(photo);
+  }
+
   @Post('cases/:caseId/visits')
   @Limit({ max: 30, windowSeconds: 60, bucket: 'upload' })
   @ApiConsumes('multipart/form-data')

@@ -123,6 +123,18 @@ def test_danger_signs_put_urgent_care_first():
     assert "Emergency care now" in r["report_markdown"]
 
 
+def test_report_states_depth_redness_and_a_later_after_photo():
+    red = {"delta_a": 9.0, "level": "marked", "white_balanced": True}
+    r = report(pre=obs({"granulation": 100}, 10.0, periwound_redness=red), assessment={"depth_cm": 0.8})
+    md = r["report_markdown"]
+    assert "Depth, probed by the clinician: 0.8 cm" in md and "Redness around the wound" in md and "marked" in md
+    assert "Depth: not recorded" in report()["report_markdown"]
+    later = report(pre=obs({"granulation": 100}, 10.0), post=obs({"granulation": 100}, 6.0, day=9))
+    assert "## This treatment (before → after, days apart)" in later["report_markdown"]
+    assert "After treatment: area 6.0 cm²" in later["report_markdown"]
+    assert later["progress"]["response"]["trajectory"] == "improving"
+
+
 def test_report_names_rules_version_and_never_prescribes():
     md = report("diabetic", {"body_location": "heel", "diabetes": "yes"}, pre=obs({"slough": 60, "granulation": 40}))["report_markdown"]
     assert "Rules version: care-" in md

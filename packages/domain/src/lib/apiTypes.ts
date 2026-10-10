@@ -112,7 +112,9 @@ export interface VisitView {
   draftReport: string | null;
   review: ReviewView | null;
   /** The same visit's photo after cleaning, before the dressing; null if none was taken. */
-  post: { status: VisitStatus; photoUrl: string | null; findings: AnalyzeResponse | null } | null;
+  post: { status: VisitStatus; photoUrl: string | null; findings: AnalyzeResponse | null; takenAt: string } | null;
+  /** The wound's depth the clinician probed at this visit; null if not recorded. */
+  depthCm: number | null;
   /** Healing and care suggestions, once the treatment report has run. */
   progress: Progress | null;
   care: Care | null;

@@ -2,13 +2,13 @@
 import { useState, type ReactNode } from "react";
 import { AlertOctagon, AlertTriangle, Ban, CheckCircle2, ClipboardCheck, Download, PencilLine, Trash2, XCircle } from "lucide-react";
 import {
-  isUncertain,
-  woundTypeName,
+  healingVerdict,
+  postPhotoLabel,
+  woundFacts,
   type Care,
-  type ClassResult,
   type Outline,
   type AnalyzeResponse,
-  type PhotoChange,
+  type HealingState,
   type Progress,
   type ReviewDecision,
   type SuggestionDecisions,
@@ -19,15 +19,6 @@ import { useDeleteVisit, useReviewVisit } from "../../lib/queries";
 import { dateTimeText } from "../../lib/format";
 import { Button } from "../ui/button";
 import { fieldClass } from "../ui/field";
-
-const pct = (p: number) => `${Math.round(p * 100)}%`;
-
-const SEVERITY_NAMES: Record<string, string> = {
-  pu_stage: "Pressure injury stage",
-  burn_depth: "Burn depth",
-  dfu_wagner: "Wagner grade",
-  dfu_infection: "Infection/ischaemia",
-};
 
 /** Tissue layer colours: the colours clinicians already associate with each tissue. */
 export const TISSUE_COLOR: Record<string, string> = {
@@ -80,19 +71,6 @@ export function WoundOverlay({ src, outline, tissue }: { src: string; outline?: 
       )}
     </div>
   );
-}
-
-/** A classification as the report writes it: a confident label, or UNCERTAIN with the top estimates. */
-function classText(result: ClassResult | undefined, name: (label: string) => string): string {
-  if (!result) return "Not assessed yet (model not installed)";
-  if (result.rule) {
-    return `${name(result.label)} (by rule: ${result.rule}${result.model ? `; model estimate: ${classText(result.model, name)}` : ""})`;
-  }
-  if (result.prob === null) return name(result.label);
-  if (isUncertain(result)) {
-    return `Uncertain — top estimates: ${result.top.map(([label, p]) => `${name(label)} ${pct(p)}`).join(", ")}`;
-  }
-  return `${name(result.label)} (model confidence ${pct(result.prob)})`;
 }
 
 /** The draft's markdown (headings, bullets, **bold**, _italics_) as plain elements; never injected as HTML. */
@@ -325,77 +303,36 @@ function PhasePhoto({
   );
 }
 
-const TRAJECTORY: Record<string, { label: string; tone: string }> = {
-  improving: { label: "Improving", tone: "text-emerald-800 bg-emerald-50 border-emerald-200" },
-  static: { label: "Static", tone: "text-amber-800 bg-amber-50 border-amber-200" },
-  deteriorating: { label: "Deteriorating", tone: "text-red-800 bg-red-50 border-red-200" },
+const VERDICT_TONE: Record<HealingState, string> = {
+  improving: "text-emerald-800 bg-emerald-50 border-emerald-200",
+  static: "text-amber-800 bg-amber-50 border-amber-200",
+  deteriorating: "text-red-800 bg-red-50 border-red-200",
+  baseline: "text-slate-700 bg-slate-50 border-slate-200",
+  not_compared: "text-slate-700 bg-slate-50 border-slate-200",
 };
 
-const changeText = (c: PhotoChange | undefined): string | null => {
-  if (!c) return null;
-  const parts: string[] = [];
-  if (c.percent_area_reduction !== undefined) {
-    parts.push(`${c.area_before_cm2} → ${c.area_after_cm2} cm² (${Math.abs(c.percent_area_reduction)}% ${c.percent_area_reduction >= 0 ? "smaller" : "larger"})`);
-    if (c.cm2_per_week !== undefined) parts.push(`${c.cm2_per_week} cm²/week`);
-  }
-  if (c.nonviable_before_pct !== undefined) parts.push(`non-viable tissue ${c.nonviable_before_pct}% → ${c.nonviable_after_pct}%`);
-  if (!parts.length) return null;
-  return `${parts.join(" · ")}${c.days ? ` over ${c.days} days` : ""}`;
-};
-
-/** How the wound is healing visit to visit (like with like), and what this visit's cleaning did. */
+/** Is the wound healing or getting worse: visit to visit (like with like), from the before to the after photo
+ * when they are days apart, and what this visit's cleaning did. */
 function HealingPanel({ progress }: { progress: Progress }) {
-  const h = progress.healing;
-  const s = progress.session;
-  const t = h.trajectory ? TRAJECTORY[h.trajectory] : undefined;
-  const rows: [string, string | null][] = [
-    ["Since last visit", changeText(h.since_last)],
-    ["Since first visit", changeText(h.since_first)],
-    [
-      "4-week check",
-      h.four_week
-        ? `${h.four_week.percent_area_reduction}% smaller at day ${h.four_week.days} (target ${h.four_week.target}%): ${h.four_week.on_track ? "on track" : "not on track"}`
-        : null,
-    ],
-    [
-      "This visit",
-      s
-        ? [
-            s.area_before_cm2 !== undefined ? `${s.area_before_cm2} → ${s.area_after_cm2} cm²${s.area_note ? ` (${s.area_note})` : ""}` : null,
-            s.nonviable_before_pct !== undefined ? `non-viable tissue ${s.nonviable_before_pct}% → ${s.nonviable_after_pct}%` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ") || null
-        : null,
-    ],
-    ["PUSH score", progress.push ? `${progress.push.score}/17 (${progress.push.note})` : null],
-  ];
+  const v = healingVerdict(progress);
+  if (!v) return null;
   return (
     <section className="rounded-2xl border border-black/10 p-4 dark:border-white/10">
       <div className="flex flex-wrap items-center gap-2">
         <p className="text-sm font-semibold">Healing</p>
-        {t ? (
-          <span className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${t.tone}`}>{t.label}</span>
-        ) : (
-          <span className="text-xs text-muted-foreground">Not compared: {h.reason ?? "not enough photos"}</span>
-        )}
-        {h.trajectory && (
-          <span className="text-xs text-muted-foreground">
-            by {h.basis}, comparing {h.phase === "post" ? "after-cleaning" : "before-treatment"} photos; changes within measurement noise
-            {h.noise_band ? ` (${h.noise_band.smaller_pct}% smaller to ${h.noise_band.larger_pct}% larger; ${h.noise_band.source})` : ""} count as static
-          </span>
-        )}
+        <span className={`rounded-full border px-2.5 py-0.5 text-xs font-medium ${VERDICT_TONE[v.state]}`}>{v.title}</span>
+        <span className="text-xs text-muted-foreground">{v.detail}</span>
       </div>
-      <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
-        {rows
-          .filter((r): r is [string, string] => r[1] !== null)
-          .map(([label, value]) => (
+      {v.rows.length > 0 && (
+        <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
+          {v.rows.map(({ label, value }) => (
             <div key={label}>
               <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{label}</dt>
               <dd className="mt-0.5">{value}</dd>
             </div>
           ))}
-      </dl>
+        </dl>
+      )}
     </section>
   );
 }
@@ -473,43 +410,27 @@ export function VisitResult({ caseId, visit, canDelete = true }: { caseId: strin
   const f: AnalyzeResponse = visit.findings ?? { status: "ok" }; // shown only once the analysis is done
   const [showTissue, setShowTissue] = useState(false);
   const hasTissue = !!(f.tissue_outline || visit.post?.findings?.tissue_outline);
-  const m = f.measurement;
   const change = f.change?.percent_area_reduction;
   const flags = [...(f.flags ?? []), ...(visit.progress?.flags ?? []).filter((p) => !f.flags?.some((x) => x.text === p.text))].sort((a, b) =>
     a.level === b.level ? 0 : a.level === "urgent" ? -1 : 1,
   );
 
   const findings: [string, string][] = [
-    ["Wound type", classText(f.wound_type, woundTypeName)],
-    ...Object.entries(f.severity ?? {}).map(([head, result]): [string, string] => [
-      SEVERITY_NAMES[head] ?? head.replace(/_/g, " "),
-      classText(result, (label) => label.replace(/_/g, " ")),
-    ]),
-    [
-      "Size",
-      m
-        ? `${m.area_cm2} cm² · ${m.length_cm} × ${m.width_cm} cm · perimeter ${m.perimeter_cm} cm`
-        : f.marker_found === false
-          ? "Not measured: calibration sticker not found in the photo"
-          : "Not measured: no wound outline yet (outline model not installed)",
-    ],
+    ...woundFacts(f, visit.depthCm).map(({ label, value }): [string, string] => [label, value]),
     ...(change !== undefined && !visit.progress
       ? [[
           "Change",
           `${change >= 0 ? "Smaller" : "Larger"} by ${Math.abs(change)}% since the last measured photo${f.change?.days_between ? ` (${f.change.days_between} days)` : ""}`,
         ] as [string, string]]
       : []),
-    ...(f.tissue_pct ? [["Tissue", Object.entries(f.tissue_pct).map(([k, v]) => `${k} ${v}%`).join(", ")] as [string, string]] : []),
-    ...(f.tissue_untrusted?.length
-      ? [["Possibly also", `${f.tissue_untrusted.map((c) => c.replace(/_/g, " ")).join(", ")} (the tissue model is not yet reliable for these: check on examination)`] as [string, string]]
-      : []),
-    ...(!f.tissue_pct && f.tissue_pct_uncertain
-      ? [[
-          "Tissue",
-          `Uncertain (model confidence ${pct(f.tissue_confidence ?? 0)}): ${Object.entries(f.tissue_pct_uncertain).map(([k, v]) => `${k} ${v}%`).join(", ")}. Assess on examination.`,
-        ] as [string, string]]
-      : []),
   ];
+  // After cleaning in the same visit, or after the treatment has had days to work: the photos' dates decide.
+  const postLabel = visit.post ? postPhotoLabel(visit.takenAt, visit.post.takenAt) : undefined;
+  // Only what can differ from the first photo: the type and grade are the wound's, not the photo's.
+  const postFindings =
+    visit.post?.status === "ok" && visit.post.findings
+      ? woundFacts(visit.post.findings).filter(({ label }) => ["Size", "Tissue", "Possibly also", "Redness around the wound"].includes(label))
+      : [];
 
   return (
     <div className="flex flex-col gap-5">
@@ -551,11 +472,11 @@ export function VisitResult({ caseId, visit, canDelete = true }: { caseId: strin
           />
           {visit.post && (
             <PhasePhoto
-              label="After cleaning"
+              label={postLabel}
               src={visit.post.photoUrl}
               outline={visit.post.findings?.outline}
               tissue={showTissue ? visit.post.findings?.tissue_outline : null}
-              filename={`wound-T${visit.sequence}-after-cleaning-outlined.jpg`}
+              filename={`wound-T${visit.sequence}-after-outlined.jpg`}
               note={
                 visit.post.status === "processing"
                   ? "Analysing…"
@@ -574,9 +495,19 @@ export function VisitResult({ caseId, visit, canDelete = true }: { caseId: strin
             </div>
           ))}
           <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Analysed</dt>
+            <dt className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Photo taken</dt>
             <dd className="mt-0.5">{dateTimeText(visit.takenAt)}</dd>
           </div>
+          {postFindings.length > 0 && (
+            <div className="border-t border-black/5 pt-3 dark:border-white/10">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{postLabel}</p>
+              {postFindings.map(({ label, value }) => (
+                <p key={label} className="mt-1">
+                  <span className="font-medium">{label}:</span> {value}
+                </p>
+              ))}
+            </div>
+          )}
           {hasTissue && (
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={showTissue} onChange={(e) => setShowTissue(e.target.checked)} />

@@ -105,6 +105,7 @@ export const toReviewView = (r: ReviewRow): ReviewView => ({
 interface ImageRow {
   imageUrl: string;
   thumbPath: string | null;
+  takenAt?: Date | null;
 }
 
 export interface VisitRow {
@@ -120,8 +121,9 @@ export interface VisitRow {
   createdAt: Date;
   review?: ReviewRow | null;
   phase: {
-    treatment: { id: string; sequence: number; phases: { image: ImageRow | null; aiResult: { status: string; findings: unknown } | null }[] };
+    treatment: { id: string; sequence: number; phases: { image: ImageRow | null; aiResult: { status: string; findings: unknown; createdAt?: Date } | null }[] };
     image: ImageRow | null;
+    assessment?: { depthCm: number | null } | null;
   };
 }
 
@@ -137,7 +139,8 @@ export const toVisitView = (r: VisitRow, urls: Map<string, string | null>): Visi
   sequence: r.phase.treatment.sequence,
   status: r.status as VisitStatus,
   error: r.error,
-  takenAt: r.createdAt.toISOString(),
+  // When the phone took the photo; the upload time for photos added in the portal.
+  takenAt: (r.phase.image?.takenAt ?? r.createdAt).toISOString(),
   photoUrl: r.phase.image ? urls.get(r.phase.image.imageUrl) ?? null : null,
   thumbUrl: r.phase.image?.thumbPath ? urls.get(r.phase.image.thumbPath) ?? null : null,
   findings: (r.findings as AnalyzeResponse | null) ?? null,
@@ -145,6 +148,7 @@ export const toVisitView = (r: VisitRow, urls: Map<string, string | null>): Visi
   draftReport: r.draftReport,
   review: r.review ? toReviewView(r.review) : null,
   post: postOf(r, urls),
+  depthCm: r.phase.assessment?.depthCm ?? null,
   progress: (r.progress as Progress | null) ?? null,
   care: (r.care as Care | null) ?? null,
   rulesVersion: r.rulesVersion,
@@ -157,6 +161,7 @@ const postOf = (r: VisitRow, urls: Map<string, string | null>): VisitView['post'
     status: (post.aiResult?.status ?? 'processing') as VisitStatus,
     photoUrl: urls.get(post.image.imageUrl) ?? null,
     findings: (post.aiResult?.findings as AnalyzeResponse | null) ?? null,
+    takenAt: (post.image.takenAt ?? post.aiResult?.createdAt ?? r.createdAt).toISOString(),
   };
 };
 
@@ -187,11 +192,12 @@ export const visitSelect = {
           sequence: true,
           phases: {
             where: { phaseType: 'POST', deletedAt: null },
-            select: { image: { select: { imageUrl: true, thumbPath: true } }, aiResult: { select: { status: true, findings: true } } },
+            select: { image: { select: { imageUrl: true, thumbPath: true, takenAt: true } }, aiResult: { select: { status: true, findings: true, createdAt: true } } },
           },
         },
       },
-      image: { select: { imageUrl: true, thumbPath: true } },
+      image: { select: { imageUrl: true, thumbPath: true, takenAt: true } },
+      assessment: { select: { depthCm: true } },
     },
   },
 } as const;

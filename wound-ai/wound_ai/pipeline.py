@@ -24,7 +24,8 @@ import torch
 from .data import (IMAGENET_MEAN, IMAGENET_STD, PERIWOUND, TISSUE_CLASSES, WOUND_BED, MetaEncoder, crop_to_wound,
                    read_rgb, wound_box)
 from .intake import FOOT_SITES
-from .measure import area_change, find_marker, grey_patch_gains, measure_wound
+from .measure import (Calibration, area_change, distance_calibration, find_marker, grey_patch_gains, length_calibration,
+                      measure_wound)
 from .models import WoundClassifier, build_seg_model
 from .quality import check_quality
 from .report import FLAGS_VERSION, build_report, red_flags
@@ -38,6 +39,9 @@ TISSUE_MIN_CONFIDENCE = 0.6
 UNTRUSTED_MENTION_FRAC = 0.05
 # Outline regions smaller than this share of the photo are specks, not wound (works without a sticker).
 MIN_OUTLINE_FRAC = 0.0005
+# How much redder (CIELAB a*) the skin beside the wound is than skin further out, to be called mild or marked.
+# PLACEHOLDER: set from clinic photos the clinician has graded for redness.
+REDNESS_MILD, REDNESS_MARKED = 4.0, 8.0
 
 
 def apply_diabetic_foot_rule(wound_type: dict | None, intake: dict) -> dict | None:
@@ -65,6 +69,27 @@ def mask_outline(mask: np.ndarray | None) -> list[list[list[float]]] | None:
         if len(points) >= 3:
             polygons.append([[round(float(x) / w, 4), round(float(y) / h, 4)] for x, y in points])
     return polygons or None
+
+
+def periwound_redness(img: np.ndarray, mask: np.ndarray, white_balanced: bool = False) -> dict | None:
+    """Redness of the skin around the wound from colour alone: the skin beside the wound against skin further out
+    (CIELAB a*, the red-green axis), so the patient's own skin is the reference. A hint for the clinician, used by
+    no flag or care rule: redness shows less on darker skin, so "none" never rules it out."""
+    bed = mask > 0
+    if not bed.any():
+        return None
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    # Shadow, glare and the sticker's black and white are not skin.
+    skin = (lab[..., 0] > 30) & (lab[..., 0] < 235)
+    dist = cv2.distanceTransform((~bed).astype(np.uint8), cv2.DIST_L2, 3)
+    w = max(4.0, 0.15 * float(np.sqrt(bed.sum())))  # ring width follows the wound's size, not the photo's
+    near, far = skin & (dist > 0) & (dist <= w), skin & (dist > 2 * w) & (dist <= 3 * w)
+    if near.sum() < 50 or far.sum() < 50:
+        return None
+    a = lab[..., 1].astype(np.float32)
+    delta = round(float(np.median(a[near]) - np.median(a[far])), 1)
+    level = "marked" if delta >= REDNESS_MARKED else "mild" if delta >= REDNESS_MILD else "none"
+    return {"delta_a": delta, "level": level, "white_balanced": white_balanced}
 
 
 # Same colours as the portal (apps/web VisitResult.tsx TISSUE_COLOR), as RGB.
@@ -227,18 +252,26 @@ class WoundAnalyzer:
                "top": [(c["classes"][i], round(float(probs[i]), 3)) for i in order[:3]]}
         return (out, probs) if return_probs else out
 
-    def analyze(self, image: str | np.ndarray, intake: dict | None = None, previous: dict | None = None,
-                overlay_path: str | None = None) -> dict:
-        intake = dict(intake or {})
-        img = read_rgb(image) if isinstance(image, (str, Path)) else image
+    def capture_check(self, img: np.ndarray, scale: dict | None = None) -> tuple[dict, Calibration | None]:
+        """What can be said about a photo before any model runs: its quality, and what gives it a scale (the
+        calibration sticker in it, or the phone's distance reading sent with it). The app asks for this alone when
+        a photo is taken, so it can be retaken while the patient is there."""
         calib = find_marker(img, self.marker_mm)
         q = check_quality(img)
-        f = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="minutes"), "intake": intake,
-             "quality": {"ok": q.ok, "usable": q.usable, "issues": q.issues, "warnings": q.warnings, **q.metrics},
-             "marker_found": calib is not None,
+        return {"quality": {"ok": q.ok, "usable": q.usable, "issues": q.issues, "warnings": q.warnings, **q.metrics},
+                "marker_found": calib is not None, "phone_reading": scale}, calib
+
+    def analyze(self, image: str | np.ndarray, intake: dict | None = None, previous: dict | None = None,
+                overlay_path: str | None = None, scale: dict | None = None) -> dict:
+        """`scale`: the phone's own reading when it took the photo, {"distance_mm", "hfov_deg"} (see
+        measure.distance_calibration). It gives the size when the photo has no sticker."""
+        intake = dict(intake or {})
+        img = read_rgb(image) if isinstance(image, (str, Path)) else image
+        checks, calib = self.capture_check(img, scale)
+        f = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="minutes"), "intake": intake, **checks,
              "model_versions": {**{k: v["version"] for k, v in self.seg.items()},
                                 **{k: v["version"] for k, v in self.cls.items()}}}
-        if not q.usable:  # blank, tiny, all black or white: nothing to analyse, ask for a retake
+        if not f["quality"]["usable"]:  # blank, tiny, all black or white: nothing to analyse, ask for a retake
             f["status"] = "retake"
             return f
 
@@ -261,18 +294,41 @@ class WoundAnalyzer:
             if head in self.cls and (wt == applies_to or (applies_to == "burn" and intake.get("cause") == "burn")):
                 f["severity"][head] = self._classify(img, head, intake)
 
-        if "tissue" in self.seg and mask is not None:
-            # Tissue is judged by colour, so correct the lighting's colour cast from the sticker's grey patch.
+        if mask is not None:
+            # Tissue and redness are judged by colour, so correct the lighting's colour cast from the sticker's grey patch.
             gains = grey_patch_gains(img, calib, self.marker_mm) if calib is not None else None
             f["white_balance"] = gains
             balanced = img if gains is None else np.clip(img * np.array(gains, np.float32), 0, 255).astype(np.uint8)
-            f.update(self._tissue(balanced, mask))
+            if "tissue" in self.seg:
+                f.update(self._tissue(balanced, mask))
+            f["periwound_redness"] = periwound_redness(balanced, mask, gains is not None)
 
         f["outline"] = mask_outline(mask)
         f["measurement"] = None
-        if calib is not None and mask is not None:
-            m = measure_wound(mask, calib)
-            f["measurement"] = m.to_dict() if m else None
+        # The sticker wins when the photo has both: it lies on the skin itself, so it needs no reading of the surface.
+        by_phone = distance_calibration(scale["distance_mm"], scale["hfov_deg"], (img.shape[1], img.shape[0]),
+                                        scale.get("normal")) if scale else None
+        entered = intake.get("measured_length_cm")
+        by_length = length_calibration(mask, entered) if mask is not None else None
+        # What was measured most directly comes first; the clinician's ruler length is the last resort.
+        method, ruler = next(((name, c) for name, c in (("sticker", calib), ("phone_distance", by_phone),
+                                                        ("entered_length", by_length)) if c is not None), (None, None))
+        if ruler is not None and mask is not None:
+            m = measure_wound(mask, ruler)
+            f["measurement"] = {**m.to_dict(), "method": method} if m else None
+            check = {}
+            other = measure_wound(mask, by_phone) if m and calib is not None and by_phone is not None else None
+            if other:
+                # Both in one photo: how far the phone's reading is from the sticker, which is how its accuracy is checked.
+                check.update({
+                    "sticker_area_cm2": round(m.area_cm2, 2), "phone_area_cm2": round(other.area_cm2, 2),
+                    "phone_vs_sticker_pct": round(100 * (other.area_cm2 - m.area_cm2) / m.area_cm2, 1)})
+            if m and method != "entered_length" and by_length is not None:
+                # A ruler length alongside a measured size: the same check against the clinician's own measurement.
+                check.update({"entered_length_cm": entered, "measured_length_cm": round(m.length_cm, 2),
+                              "length_vs_entered_pct": round(100 * (m.length_cm - entered) / entered, 1)})
+            if check:
+                f["measurement_check"] = check
         if previous and f["measurement"] and previous.get("area_cm2"):
             f["change"] = area_change(f["measurement"]["area_cm2"], previous["area_cm2"], previous.get("days_ago"))
 

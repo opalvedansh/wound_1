@@ -2,11 +2,13 @@
 
     WOUND_API_KEY=... CKPT_DIR=checkpoints uvicorn api.server:app --host 0.0.0.0 --port 8000
 
-Endpoints (all but /health need the X-API-Key header to match WOUND_API_KEY)
+Endpoints (all but /health and /try need the X-API-Key header to match WOUND_API_KEY)
   GET  /health                    model versions
+  GET  /try                       a page to upload a photo and see the outlined photo beside the findings
   GET  /intake/questions          core intake questions for the form
   POST /intake/follow-ups         extra questions given answers so far (+ model's first guess)
-  POST /analyze                   photo + intake answers -> findings + report draft
+  POST /check                     photo -> its quality and what gives it a scale: sticker or phone reading (no model runs)
+  POST /analyze                   photo + intake answers (+ the phone's distance reading) -> findings + report draft
   POST /analyze/overlay           photo -> the photo with the wound outline drawn on it (JPEG), for checking by eye
   POST /treatment-report          a wound's analysed photos so far -> healing, care suggestions, draft
   POST /review                    clinician approves / edits / rejects a draft
@@ -33,10 +35,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cv2
 import numpy as np
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from wound_ai.care import treatment_report
 from wound_ai.intake import CORE_QUESTIONS, follow_up_questions
+from wound_ai.measure import DISTANCE_MM, HFOV_DEG, phone_reading, valid_reading
 from wound_ai.pipeline import WoundAnalyzer, draw_overlay
 
 CKPT_DIR = os.environ.get("CKPT_DIR", "checkpoints")
@@ -93,6 +97,13 @@ def health():
                                    **{k: v["version"] for k, v in analyzer.cls.items()}}}
 
 
+@app.get("/try", include_in_schema=False)
+def try_page():
+    """A page for checking a photo by eye: the outlined photo beside the findings. The page holds no key; its
+    requests to /analyze carry the one typed into it."""
+    return FileResponse(Path(__file__).with_name("try.html"), media_type="text/html")
+
+
 @app.get("/intake/questions", dependencies=keyed)
 def questions():
     return CORE_QUESTIONS
@@ -103,15 +114,30 @@ def follow_ups(req: FollowUpRequest):
     return follow_up_questions(req.answers, req.predicted_type)
 
 
+@app.post("/check", dependencies=keyed)
+def check(image: UploadFile = File(...)):
+    """The capture checks alone: the photo's quality and whether the calibration sticker is in it. No model runs, so
+    the answer is quick enough to show while the photo can still be retaken. Nothing is stored."""
+    data, rgb = read_upload(image)
+    return analyzer.capture_check(rgb, phone_reading(data))[0]
+
+
 # A plain `def`: inference is synchronous, so FastAPI runs it in a worker thread instead of blocking the server.
 @app.post("/analyze", dependencies=keyed)
 def analyze(image: UploadFile = File(...), intake: str = Form("{}"), previous: str = Form(""),
-            phase: str = Form("pre")):
+            phase: str = Form("pre"), scale: str = Form("")):
+    """`scale` is the phone's own reading from when it took the photo, as JSON: {"distance_mm": to the wound,
+    "hfov_deg": the camera's field of view across the photo's width}. It gives the size when there is no sticker.
+    The phone app writes the same reading into the photo itself (see measure.phone_reading), so it is normally
+    left out here."""
     try:
         answers = json.loads(intake or "{}")
         prev = json.loads(previous) if previous else None
+        reading = json.loads(scale) if scale else None
     except json.JSONDecodeError:
-        raise HTTPException(400, "intake/previous must be JSON")
+        raise HTTPException(400, "intake/previous/scale must be JSON")
+    if reading is not None and not valid_reading(reading):
+        raise HTTPException(400, f"scale must be distance_mm within {DISTANCE_MM} and hfov_deg within {HFOV_DEG}")
     if not isinstance(answers, dict):
         raise HTTPException(400, "intake must be a JSON object")
     if phase not in ("pre", "post"):
@@ -121,7 +147,7 @@ def analyze(image: UploadFile = File(...), intake: str = Form("{}"), previous: s
         raise HTTPException(400, {"error": "required intake answers missing", "missing": missing})
     data, rgb = read_upload(image)
     case_id = uuid.uuid4().hex
-    f = analyzer.analyze(rgb, answers, prev)
+    f = analyzer.analyze(rgb, answers, prev, scale=reading or phone_reading(data))
     f["case_id"] = case_id
     f["phase"] = phase
     # After cleaning, in the same visit: the PRE photo's answers already chose the follow-ups.

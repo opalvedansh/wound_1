@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from cv import PY, gpu_count, in_parallel, mean_sd  # noqa: E402
+from cv import FINAL_FOLDS, PY, gpu_count, in_parallel, mean_sd  # noqa: E402
 
 HEADS = ("pu_stage", "burn_depth", "dfu_wagner")
 
@@ -46,6 +46,9 @@ def parse():
     p.add_argument("--trust-f1", type=float, default=0.6, help="mean locked-test macro-F1 a head needs to be installed")
     p.add_argument("--min-test", type=int, default=30, help="test photos a head needs before it can be trusted at all")
     p.add_argument("--out", default="runs/severity_cv")
+    p.add_argument("--final-fit", action="store_true",
+                   help="train each trusted head once more on all but 1/20 of its non-test photos and install that "
+                        "model if its locked-test macro-F1 is at least the folds' mean")
     p.add_argument("--smoke", action="store_true", help="debug: tiny run (3 batches, 1 epoch, no pretrained weights)")
     return p.parse_args()
 
@@ -65,18 +68,23 @@ def main():
     dirs = {(h, f): out / h / f"fold{f}" for h in heads for f in range(a.folds)}
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
-    jobs = [(f"{h} {f + 1}/{a.folds}",
-             [PY, "scripts/train_cls.py", "--manifest", a.manifest, "--target", h, "--backbone", a.backbone,
-              "--size", str(a.size), "--batch-size", str(a.batch), "--epochs", str(a.epochs), "--patience", str(a.patience),
-              "--workers", str(a.workers), "--folds", str(a.folds), "--fold", str(f), "--out", str(d), *init, *smoke],
-             d / "log.txt", d / ".done") for (h, f), d in dirs.items()]
+
+    def train_cmd(h: str, fold: int, folds: int, d: Path) -> list[str]:
+        return [PY, "scripts/train_cls.py", "--manifest", a.manifest, "--target", h, "--backbone", a.backbone,
+                "--size", str(a.size), "--batch-size", str(a.batch), "--epochs", str(a.epochs), "--patience", str(a.patience),
+                "--workers", str(a.workers), "--folds", str(folds), "--fold", str(fold), "--out", str(d), *init, *smoke]
+
+    def test_cmd(d: Path) -> list[str]:
+        return [PY, "scripts/evaluate.py", "--manifest", a.manifest, "--ckpt-dir", str(d), "--group-cols", "source",
+                "--out", str(d / "eval_test.json")]
+
+    jobs = [(f"{h} {f + 1}/{a.folds}", train_cmd(h, f, a.folds, d), d / "log.txt", d / ".done") for (h, f), d in dirs.items()]
     codes = in_parallel(jobs, gpus)
     if any(codes):
         sys.exit(f"failed: {[jobs[i][0] for i, c in enumerate(codes) if c]}. Run the same command again.")
     print(f"training done in {(time.time() - t0) / 3600:.1f} h; scoring every fold on its locked test photos", flush=True)
-    in_parallel([(f"test {h} {f + 1}", [PY, "scripts/evaluate.py", "--manifest", a.manifest, "--ckpt-dir", str(d),
-                                       "--group-cols", "source", "--out", str(d / "eval_test.json")],
-                  d / "eval_log.txt", d / ".evaluated") for (h, f), d in dirs.items()], gpus, quiet=True)
+    in_parallel([(f"test {h} {f + 1}", test_cmd(d), d / "eval_log.txt", d / ".evaluated") for (h, f), d in dirs.items()],
+                gpus, quiet=True)
 
     import torch
 
@@ -97,12 +105,27 @@ def main():
         n_test = folds[0]["test_n"] or 0
         trusted = n_test >= a.min_test and cv["test_macro_f1"]["mean"] is not None and cv["test_macro_f1"]["mean"] >= a.trust_f1
         best = max(folds, key=lambda r: r["val_macro_f1"] or 0)
-        ck = torch.load(dirs[(h, best["fold"])] / f"{h}.pt", map_location="cpu", weights_only=False)
-        ck["cv"] = {"folds": a.folds, **cv, "sensitivity": sens, "fold": best["fold"], "trusted": trusted}
+        source, final = dirs[(h, best["fold"])], None
+        if a.final_fit and trusted:
+            # The same settings on nearly all of the head's non-test photos, scored on the same locked test photos.
+            d = out / h / "final"
+            d.mkdir(parents=True, exist_ok=True)
+            n = 2 if a.smoke else FINAL_FOLDS  # the smoke test's few patients cannot fill 20 folds
+            if in_parallel([(f"final {h}", train_cmd(h, 0, n, d), d / "log.txt", d / ".done")], gpus)[0]:
+                sys.exit(f"the final fit of {h} failed. Run the same command again.")
+            in_parallel([(f"test final {h}", test_cmd(d), d / "eval_log.txt", d / ".evaluated")], gpus, quiet=True)
+            score = (json.loads((d / "eval_test.json").read_text())["components"].get(h, {}).get("macro_f1") or [None])[0]
+            final = {"test_macro_f1": score, "installed": score is not None and score >= cv["test_macro_f1"]["mean"]}
+            if final["installed"]:
+                source = d
+        ck = torch.load(source / f"{h}.pt", map_location="cpu", weights_only=False)
+        ck["cv"] = {"folds": a.folds, **cv, "sensitivity": sens, "fold": best["fold"], "trusted": trusted,
+                    **({"final_fit": final} if final else {})}
         dest = out / ("best" if trusted else "untrusted")
         dest.mkdir(exist_ok=True)
         torch.save(ck, dest / f"{h}.pt")
-        summary["heads"][h] = {"per_fold": folds, "cv": cv, "sensitivity": sens, "trusted": trusted, "best_fold": best["fold"]}
+        summary["heads"][h] = {"per_fold": folds, "cv": cv, "sensitivity": sens, "trusted": trusted, "best_fold": best["fold"],
+                               **({"final_fit": final} if final else {})}
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 
     def fmt(ms):
@@ -116,6 +139,11 @@ def main():
     for h, v in summary["heads"].items():
         md.append(f"| {h} | {v['per_fold'][0]['test_n']} | {fmt(v['cv']['val_macro_f1'])} | {fmt(v['cv']['test_macro_f1'])} | "
                   f"{fmt(v['cv']['test_accuracy'])} | {fmt(v['cv']['test_auroc'])} | {'yes' if v['trusted'] else 'no'} |")
+    for h, v in summary["heads"].items():
+        if v.get("final_fit"):
+            f = v["final_fit"]
+            md += ["", f"{h}, final fit on all but 1/{FINAL_FOLDS} of its photos: test macro-F1 {f['test_macro_f1']:.3f} "
+                       f"({'installed' if f['installed'] else 'below the folds, best fold kept'})"]
     for h, v in summary["heads"].items():
         md += ["", f"{h}, test sensitivity per class: " + ", ".join(f"{c} {fmt(s)}" for c, s in v["sensitivity"].items())]
     (out / "summary.md").write_text("\n".join(md) + "\n")

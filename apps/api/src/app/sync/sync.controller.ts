@@ -31,14 +31,19 @@ export class SyncController {
   @Roles('ADMIN', 'DOCTOR')
   @Limit({ max: 30, windowSeconds: 60, bucket: 'upload' })
   @ApiConsumes('multipart/form-data')
-  @ApiOperation({ summary: 'Upload the pre- or post-treatment photo of a synced treatment. The pre photo is analysed in the background.' })
+  @ApiOperation({
+    summary:
+      "Upload the pre- or post-treatment photo of a synced treatment, optionally with `measured_length_cm` (the wound's longest length by ruler, which gives a photo without a sticker its scale) and `taken_at` (when the phone took it, ISO). The pre photo is analysed in the background.",
+  })
   @UseInterceptors(FileInterceptor('photo', { limits: { fileSize: MAX_PHOTO_BYTES, files: 1 } }))
   photo(
     @Param('id', new ParseUUIDPipe()) id: string,
     @Param('phase') phase: string,
     @UploadedFile() photo: PhotoUpload | undefined,
+    @Body('measured_length_cm') measuredLengthCm: unknown,
+    @Body('taken_at') takenAt: unknown,
     @Req() req: ClinicRequest,
   ) {
-    return this.sync.photo(clinicCtx(req), id, phase, photo);
+    return this.sync.photo(clinicCtx(req), id, phase, photo, measuredLengthCm, takenAt);
   }
 }

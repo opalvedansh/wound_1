@@ -32,7 +32,22 @@
           "backgroundColor": "#ffffff"
         }
       ],
-      "expo-sharing"
+      "expo-sharing",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "The camera is used to photograph wounds and to measure the distance to them.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Lets you choose a wound photo that is already on this device.",
+          "microphonePermission": false
+        }
+      ]
     ]
   }
 }

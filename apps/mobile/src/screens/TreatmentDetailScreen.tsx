@@ -24,7 +24,7 @@ import {
   timeAgo,
 } from '../lib/format';
 import { interactionStyle } from '../lib/interaction';
-import { aiSummary, postPhoto, prePhoto } from '../lib/photos';
+import { postLabel, postPhoto, prePhoto, woundAnalysis } from '../lib/photos';
 import { answerText } from '../lib/questionAnswers';
 import { useQuestionCatalog } from '../lib/questionCatalog';
 import { useStalledSync } from '../lib/syncStatus';
@@ -48,6 +48,15 @@ const CONTENT_MAX_WIDTH = 680;
 const tone = {
   tile: '#F1F3F5',
 };
+
+/** The healing verdict's colour: the same three the clinician's own trend uses. */
+const VERDICT_COLOR = {
+  improving: TREND_COLOR.Improving,
+  static: TREND_COLOR.Static,
+  deteriorating: TREND_COLOR.Deteriorating,
+  baseline: colors.textSecondary,
+  not_compared: colors.textSecondary,
+} as const;
 
 /**
  * A form's answers on this record, as label and value rows. Built-in answers are labelled with the question
@@ -175,7 +184,7 @@ export const TreatmentDetailScreen = () => {
   // The next visit and the trend are already in the fact strip.
   const care = recordedAnswers(catalog, 'care', therapy, therapy?.responses, ['nextVisitDate']);
   const findings = recordedAnswers(catalog, 'assessment', assessment, assessment?.responses, ['woundAppearanceTrend']);
-  const ai = aiSummary(treatment);
+  const analysis = woundAnalysis(treatment);
 
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
@@ -209,13 +218,50 @@ export const TreatmentDetailScreen = () => {
               due={treatment.phase === 'PRE'}
               note={carriedFrom !== undefined ? `Carried forward from treatment ${carriedFrom}` : undefined}
             />
-            <PhaseImage phase="post" uri={postPhoto(treatment)} due={treatment.phase === 'POST'} />
+            <PhaseImage phase="post" uri={postPhoto(treatment)} due={treatment.phase === 'POST'} note={postLabel(treatment)} />
           </View>
 
-          {ai && (
+          {analysis && (
             <>
-              <SectionHeader title="AI draft" note="For a clinician to review" />
-              <DetailList rows={ai} />
+              <SectionHeader title="Wound analysis" note="AI draft for a clinician to review" />
+              {analysis.notice !== undefined ? (
+                <Text style={styles.absent}>{analysis.notice}</Text>
+              ) : (
+                <>
+                  {analysis.flags.map((flag) => (
+                    <View key={flag.text} style={[styles.flag, flag.level === 'urgent' && styles.flagUrgent]}>
+                      <Text style={[styles.flagText, flag.level === 'urgent' && styles.flagTextUrgent]}>
+                        <Text style={styles.flagLevel}>{flag.level === 'urgent' ? 'Urgent: ' : 'Review: '}</Text>
+                        {flag.text}
+                      </Text>
+                    </View>
+                  ))}
+
+                  <Text style={styles.groupTitle}>{PHASE_NAME.pre} photo</Text>
+                  <DetailList rows={analysis.before} />
+
+                  {analysis.after && (
+                    <>
+                      <Text style={styles.groupTitle}>{PHASE_NAME.post} photo ({analysis.after.label.toLowerCase()})</Text>
+                      <DetailList rows={analysis.after.facts} />
+                    </>
+                  )}
+
+                  {analysis.healing && (
+                    <>
+                      <Text style={styles.groupTitle}>Healing</Text>
+                      <View style={styles.verdict}>
+                        <Text style={[styles.verdictTitle, { color: VERDICT_COLOR[analysis.healing.state] }]}>{analysis.healing.title}</Text>
+                        <Text style={styles.verdictDetail}>{analysis.healing.detail}</Text>
+                      </View>
+                      {analysis.healing.rows.length > 0 && <DetailList rows={analysis.healing.rows} />}
+                    </>
+                  )}
+
+                  <Text style={styles.groupTitle}>Review</Text>
+                  <DetailList rows={analysis.status} />
+                </>
+              )}
             </>
           )}
 
@@ -459,6 +505,54 @@ const styles = StyleSheet.create({
   absent: {
     fontSize: 15,
     lineHeight: 22,
+    color: colors.textMuted,
+  },
+
+  groupTitle: {
+    marginTop: 20,
+    marginBottom: 8,
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: '600',
+    color: colors.textPrimary,
+  },
+  flag: {
+    marginBottom: 8,
+    paddingVertical: 10,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.control,
+    borderWidth: hairline,
+    borderColor: '#FCD34D',
+    backgroundColor: '#FFFBEB',
+  },
+  flagUrgent: {
+    borderColor: '#FCA5A5',
+    backgroundColor: '#FEF2F2',
+  },
+  flagText: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: '#78350F',
+  },
+  flagTextUrgent: {
+    color: '#7F1D1D',
+  },
+  flagLevel: {
+    fontWeight: '700',
+  },
+  verdict: {
+    marginBottom: 8,
+  },
+  verdictTitle: {
+    fontSize: 20,
+    lineHeight: 26,
+    fontWeight: '700',
+    letterSpacing: -0.3,
+  },
+  verdictDetail: {
+    marginTop: 2,
+    fontSize: 14,
+    lineHeight: 20,
     color: colors.textMuted,
   },
 

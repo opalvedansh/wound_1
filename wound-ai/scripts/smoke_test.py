@@ -132,7 +132,7 @@ def main():
         run("scripts/train_seg.py", *common, "--task", "boundary", "--arch", "unet", "--encoder", "resnet18",
             "--out", str(work / "runs/boundary"))
         run("scripts/train_seg.py", *common, "--task", "tissue", "--arch", "segformer", "--encoder", "mit_b0",
-            "--crop", "--class-weights", "0.5,1,1,1,1,1,1,1", "--out", str(work / "runs/tissue"))
+            "--crop", "--class-weights", "0.5,1,1,1,1,1,1,1,1", "--out", str(work / "runs/tissue"))
         run("scripts/train_cls.py", *common, "--target", "wound_type", "--backbone", "resnet18",
             "--meta-cols", "body_location", "--out", str(work / "runs/wound_type"))
         for src in ("runs/boundary/boundary.pt", "runs/tissue/tissue.pt", "runs/wound_type/wound_type.pt"):
@@ -145,8 +145,17 @@ def main():
         pd.DataFrame({"image_path": sorted(str(p) for p in (d / "img").iterdir())[:12]}).to_csv(unl, index=False)
         run("scripts/tissue_cv.py", "--manifest", man, "--unlabeled", str(unl), "--boundary", str(ck / "boundary.pt"),
             "--arch", "unet", "--encoder", "resnet18", "--size", "128", "--batch", "4", "--workers", "0",
-            "--folds", "2", "--smoke", "--min-test-photos", "1", "--out", str(work / "tissue_cv"))
+            "--folds", "2", "--smoke", "--final-fit", "--min-test-photos", "1", "--out", str(work / "tissue_cv"))
         assert (work / "tissue_cv/best/tissue.pt").exists() and (work / "tissue_cv/summary.md").exists()
+        assert "final_fit" in json.loads((work / "tissue_cv/summary.json").read_text())
+
+        # Outline and wound type: folds, then the final fit on nearly all the photos, as the Kaggle notebook runs it.
+        run("scripts/cv.py", "--seg-manifest", man, "--cls-manifest", man, "--folds", "2", "--seg-arch", "unet",
+            "--seg-encoder", "resnet18", "--seg-size", "128", "--seg-epochs", "1", "--cls-backbone", "resnet18",
+            "--cls-size", "128", "--cls-batch", "4", "--cls-epochs", "1", "--workers", "0", "--smoke", "--final-fit",
+            "--out", str(work / "cv"))
+        cv_summary = json.loads((work / "cv/summary.json").read_text())
+        assert set(cv_summary["final_fit"]) == {"seg", "cls"} and (work / "cv/best/boundary.pt").exists()
 
         from wound_ai.pipeline import WoundAnalyzer
 

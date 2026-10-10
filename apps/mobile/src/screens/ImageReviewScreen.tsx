@@ -1,5 +1,5 @@
 import React from 'react';
-import { Image, Pressable, StyleSheet, View } from 'react-native';
+import { Image, Pressable, StyleSheet, TextInput, View } from 'react-native';
 import { useNavigation, useRoute, type RouteProp } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Feather from '@expo/vector-icons/Feather';
@@ -8,7 +8,9 @@ import { CaptureTopBar, captureColors, captureFocus } from '../components/Captur
 import { Text } from '../components/Typography';
 import { PHASE_NAME } from '../lib/format';
 import { interactionStyle } from '../lib/interaction';
-import { mockAiAdapter } from '../lib/mockAiAdapter';
+import type { PhotoCheck } from '@antigravity-project-spec-pack/domain/wound-model';
+import { ApiError } from '../lib/api';
+import { checkPhoto } from '../lib/photoCheck';
 import { supabase } from '../lib/supabase';
 import { radii, spacing } from '../lib/theme';
 import { useTreatmentContext } from '../lib/treatmentContext';
@@ -27,11 +29,18 @@ interface StatusRowProps {
   detail?: string;
 }
 
-// What to try next for each reason the quality check reports.
-const RETAKE_TIPS: Record<string, string> = {
-  'Image is too dark': 'Add light or move somewhere brighter.',
-  'Image is too blurry': 'Hold the phone steady and let the camera focus.',
-};
+/**
+ * What the wound model said about the image. `refused`: the server won't take the file (not an image, too large).
+ * `unavailable`: no answer (offline, or the model is down), so the image is checked when it is uploaded instead.
+ */
+type Check = 'checking' | 'unavailable' | { refused: string } | PhotoCheck;
+
+// What a ruler can give for a wound's length (the model service refuses anything outside this).
+const MIN_LENGTH_CM = 0.2;
+const MAX_LENGTH_CM = 60;
+
+// An image on this device. Anything else was checked when it was first taken (see `carriedFrom`).
+const isLocal = (uri?: string) => !!uri && /^(file:|data:|blob:)/.test(uri);
 
 export const ImageReviewScreen = () => {
   const navigation = useNavigation<any>();
@@ -45,13 +54,15 @@ export const ImageReviewScreen = () => {
       : undefined,
   );
 
-  const [qualityCheck, setQualityCheck] = React.useState<{ passed: boolean; reason?: string } | null>(null);
-  const [checking, setChecking] = React.useState(true);
+  const [check, setCheck] = React.useState<Check | null>(isLocal(imageUri) ? 'checking' : null);
   const [displayUri, setDisplayUri] = React.useState<string | null>(null);
+  // The wound's longest length by ruler, for an image with nothing in it to measure with.
+  const [length, setLength] = React.useState('');
 
   React.useEffect(() => {
     if (imageUri) {
-      if (imageUri.startsWith('file://') || imageUri.startsWith('mock-') || imageUri.startsWith('http')) {
+      // Anything else is a storage path. On the web a captured or chosen image is a data: or blob: address.
+      if (/^(file:|mock-|http|data:|blob:)/.test(imageUri)) {
         setDisplayUri(imageUri);
       } else {
         const fetchSignedUrl = async () => {
@@ -69,33 +80,61 @@ export const ImageReviewScreen = () => {
   }, [imageUri]);
 
   React.useEffect(() => {
-    const runCheck = async () => {
-      setChecking(true);
-      const result = await mockAiAdapter.checkImageQuality(imageUri);
-      setQualityCheck(result);
-
-      if (treatment) {
-        const existingMetadata = treatment.imageMetadata || { captureTimestamp: new Date().toISOString(), calibrated: true };
+    if (!isLocal(imageUri)) return;
+    let cancelled = false;
+    setCheck('checking');
+    checkPhoto(imageUri).then(
+      (result) => {
+        if (cancelled) return;
+        setCheck(result);
         updateTreatment(treatmentId, {
           imageMetadata: {
-            ...existingMetadata,
-            lightingScore: result.lightingScore,
-            blurScore: result.blurScore,
+            ...treatment?.imageMetadata,
+            captureTimestamp: treatment?.imageMetadata?.captureTimestamp ?? new Date().toISOString(),
+            calibrated: result.marker_found || !!result.phone_reading,
           },
         });
-      }
-      setChecking(false);
+      },
+      (error) => {
+        if (cancelled) return;
+        const refused = error instanceof ApiError && (error.status === 400 || error.status === 413);
+        setCheck(refused ? { refused: error.message } : 'unavailable');
+      },
+    );
+    return () => {
+      cancelled = true;
     };
+    // Once per image: the treatment changes as the result is stored.
+  }, [imageUri]);
 
-    if (!qualityCheck && checking) {
-      runCheck();
-    }
-  }, [imageUri, treatmentId, updateTreatment, treatment]);
+  const result = check && typeof check === 'object' && 'quality' in check ? check : null;
+  const refused = check && typeof check === 'object' && 'refused' in check ? check.refused : undefined;
+  const checking = check === 'checking';
+  const failed = refused !== undefined || result?.quality.usable === false;
+
+  // Nothing in the image gives it a scale, so the clinician's own measurement can.
+  // (Unchecked images too: the model uses the length only if it finds no sticker or phone reading.)
+  const needsLength = check === 'unavailable' || (!!result && !failed && !result.marker_found && !result.phone_reading);
+  const lengthCm = Number(length.replace(',', '.'));
+  const lengthGiven = needsLength && length.trim() !== '';
+  const lengthValid = Number.isFinite(lengthCm) && lengthCm >= MIN_LENGTH_CM && lengthCm <= MAX_LENGTH_CM;
 
   const handleApprove = () => {
-    if (qualityCheck && !qualityCheck.passed) {
-      alert('Image quality is too low to proceed. Please retake.');
+    if (failed) {
+      alert("This image can't be used. Please retake.");
       return;
+    }
+    if (lengthGiven && !lengthValid) {
+      alert(`Enter the wound's length in centimetres, between ${MIN_LENGTH_CM} and ${MAX_LENGTH_CM}, or leave it empty.`);
+      return;
+    }
+    if (treatment?.imageMetadata) {
+      updateTreatment(treatmentId, {
+        imageMetadata: {
+          ...treatment.imageMetadata,
+          measuredLengthCm: { ...treatment.imageMetadata.measuredLengthCm, [step]: lengthGiven ? lengthCm : undefined },
+        },
+      });
     }
 
     if (step === 'pre') {
@@ -112,33 +151,58 @@ export const ImageReviewScreen = () => {
   // A new treatment's pre-treatment image starts as the previous treatment's post-treatment image (see addTreatment).
   const carriedFrom =
     step === 'pre' && !!imageUri && imageUri === previous?.postImageUri ? previous.sequenceNumber : undefined;
-  const failed = qualityCheck !== null && !qualityCheck.passed;
-  const reason = qualityCheck?.reason;
 
-  const quality: StatusRowProps = checking
-    ? { icon: 'loader', color: captureColors.text, title: 'Checking image quality' }
-    : failed
+  // The model's own sentences say what is wrong and what to do next time, so they are shown as they are.
+  const quality: StatusRowProps | null = checking
+    ? { icon: 'loader', color: captureColors.text, title: 'Checking the image' }
+    : check === 'unavailable'
       ? {
-          icon: 'alert-triangle',
-          color: captureColors.warning,
-          title: 'Retake needed',
-          detail: [reason ? `${reason}.` : undefined, reason ? RETAKE_TIPS[reason] : undefined].filter(Boolean).join(' '),
+          icon: 'alert-circle',
+          color: captureColors.muted,
+          title: "Couldn't check this image now",
+          detail: 'It will be checked when it is uploaded.',
         }
-      : { icon: 'check-circle', color: captureColors.calibrated, title: 'Image quality OK' };
+      : failed
+        ? { icon: 'alert-triangle', color: captureColors.warning, title: 'Retake needed', detail: refused ?? result?.quality.issues[0] }
+        : result?.quality.issues.length
+          ? {
+              icon: 'alert-circle',
+              color: captureColors.warning,
+              title: 'Usable, but check the result against the image',
+              detail: result.quality.issues.join(' '),
+            }
+          : result
+            ? { icon: 'check-circle', color: captureColors.calibrated, title: 'Image quality OK' }
+            : null;
 
-  // Capture metadata describes the last image taken in this treatment, so it says nothing about a carried-forward one.
-  const calibrated = carriedFrom === undefined ? treatment?.imageMetadata?.calibrated : undefined;
+  // The sticker, or the distance the phone measured, is what gives the image a scale. Without either the wound
+  // is still outlined and assessed.
   const calibration: StatusRowProps | null =
-    calibrated === undefined
+    !result || failed
       ? null
-      : calibrated
-        ? { icon: 'check-circle', color: captureColors.calibrated, title: 'Calibrated' }
-        : {
-            icon: 'alert-circle',
-            color: captureColors.warning,
-            title: 'Not calibrated',
-            detail: "The calibration sticker wasn't confirmed for this image.",
-          };
+      : result.marker_found
+        ? {
+            icon: 'check-circle',
+            color: captureColors.calibrated,
+            title: 'Calibration sticker found',
+            detail: "The wound's size will be measured.",
+          }
+        : result.phone_reading
+          ? {
+              icon: 'check-circle',
+              color: captureColors.calibrated,
+              title: `Distance measured: ${Math.round(result.phone_reading.distance_mm / 10)} cm`,
+              detail: result.phone_reading.normal
+                ? "The wound's size will be measured from it, corrected for the phone's tilt."
+                : "The wound's size will be measured from it. It is right only if the phone was held square to the wound.",
+            }
+          : {
+              icon: 'alert-circle',
+              color: captureColors.warning,
+              title: 'No calibration sticker in this image',
+              detail:
+                "The wound will still be outlined and assessed. To get its size, place the sticker beside the wound and retake, or enter the wound's length below.",
+            };
 
   return (
     <View style={styles.screen}>
@@ -171,9 +235,30 @@ export const ImageReviewScreen = () => {
           <Text style={styles.note}>Carried forward from treatment {carriedFrom}'s post-treatment image.</Text>
         )}
         <View style={styles.statusList} accessibilityLiveRegion="polite">
-          <StatusRow {...quality} />
+          {quality && <StatusRow {...quality} />}
           {calibration && <StatusRow {...calibration} />}
         </View>
+        {needsLength && (
+          <View style={styles.lengthField}>
+            <Text style={styles.lengthLabel} nativeID="wound-length-label">
+              Wound length by ruler, in cm (optional)
+            </Text>
+            <TextInput
+              value={length}
+              onChangeText={setLength}
+              keyboardType="decimal-pad"
+              inputMode="decimal"
+              placeholder="e.g. 3.2"
+              placeholderTextColor={captureColors.muted}
+              accessibilityLabelledBy="wound-length-label"
+              aria-labelledby="wound-length-label"
+              style={[styles.lengthInput, lengthGiven && !lengthValid && styles.lengthInputInvalid]}
+            />
+            <Text style={styles.statusDetail}>
+              Measure the wound's longest side. The size is then worked out from that and the outline.
+            </Text>
+          </View>
+        )}
         <View style={styles.actions}>
           <Pressable
             accessibilityRole="button"
@@ -266,6 +351,30 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 20,
     color: captureColors.muted,
+  },
+
+  lengthField: {
+    marginTop: spacing.md,
+    gap: 6,
+  },
+  lengthLabel: {
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: '600',
+    color: captureColors.text,
+  },
+  lengthInput: {
+    height: 44,
+    paddingHorizontal: 12,
+    borderRadius: radii.control,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.28)',
+    fontSize: 17,
+    color: captureColors.text,
+    backgroundColor: captureColors.control,
+  },
+  lengthInputInvalid: {
+    borderColor: captureColors.warning,
   },
 
   actions: {

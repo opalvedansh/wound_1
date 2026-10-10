@@ -1,12 +1,15 @@
 """How a wound is changing: what one session achieved, and how it is healing from visit to visit.
 
-Each treatment has two photos taken minutes apart in the same visit: PRE (as found) and POST (after cleaning or
-debridement, before the dressing). So:
+Each treatment has two photos: PRE (as found) and POST. The POST photo is taken either minutes later in the same
+visit (after cleaning or debridement, before the dressing) or days later (the wound as the treatment left it). The
+photos' own dates tell which (SAME_VISIT_HOURS). So:
 
-* PRE -> POST of one treatment is the SESSION EFFECT: what the procedure did. Debridement often makes the wound
+* PRE -> POST in one visit is the SESSION EFFECT: what the procedure did. Debridement often makes the wound
   larger (the edges are opened up) while cleaning the bed, so a larger area here is expected, never "worse".
-* HEALING is measured visit to visit, comparing like with like only: POST with POST (both after cleaning, the
-  most reliable view of the wound bed), or PRE with PRE when there are no POST photos. Never PRE with POST.
+* PRE -> POST days apart is the RESPONSE to the treatment, judged as healing is.
+* HEALING is measured visit to visit, comparing like with like only: after-cleaning photos with each other (the
+  most reliable view of the wound bed), or as-found photos with each other (every PRE photo, and a POST photo
+  taken days later). Never a PRE photo with the POST photo of the same visit.
 
 Areas are compared only when both photos had the calibration sticker. Without it only the tissue mix, which
 does not depend on scale, is compared.
@@ -45,6 +48,8 @@ def load_noise(path: Path = NOISE_FILE) -> dict:
 
 NOISE = load_noise()
 NONVIABLE = ("slough", "necrosis")
+# A POST photo taken within this many hours of its PRE photo is the same visit (after cleaning). PLACEHOLDER.
+SAME_VISIT_HOURS = 12.0
 # Percent area reduction expected by about 4 weeks; below it, healing is unlikely on the current plan.
 FOUR_WEEK_TARGET = {"diabetic": 50.0, "venous": 40.0}
 FOUR_WEEK_WINDOW = (21, 35)  # days from the first photo in which the 4-week check is made
@@ -67,6 +72,7 @@ def observation(findings: dict, taken_at: str) -> dict:
         "periwound_erythema_frac": findings.get("periwound_erythema_frac"),
         "periwound_maceration_frac": findings.get("periwound_maceration_frac"),
         "periwound_callus_frac": findings.get("periwound_callus_frac"),
+        "periwound_redness": findings.get("periwound_redness"),
         "flags": findings.get("flags") or [],
     }
 
@@ -79,12 +85,23 @@ def nonviable(tissue: dict | None) -> int | None:
     return sum(tissue.get(c, 0) for c in NONVIABLE) if tissue else None
 
 
-def _days(a: dict, b: dict) -> float | None:
+def _hours(a: dict | None, b: dict | None) -> float | None:
     try:
         d = datetime.fromisoformat(b["taken_at"]) - datetime.fromisoformat(a["taken_at"])
     except (KeyError, TypeError, ValueError):
         return None
-    return round(d.total_seconds() / 86400, 1)
+    return d.total_seconds() / 3600
+
+
+def _days(a: dict, b: dict) -> float | None:
+    hours = _hours(a, b)
+    return None if hours is None else round(hours / 24, 1)
+
+
+def same_visit(pre: dict | None, post: dict | None) -> bool:
+    """Were a treatment's two photos taken in one visit? Photos without dates count as one visit."""
+    hours = _hours(pre, post)
+    return hours is None or abs(hours) < SAME_VISIT_HOURS
 
 
 def _pct_change(before: float, after: float) -> float:
@@ -95,8 +112,8 @@ def _pct_change(before: float, after: float) -> float:
 # --------------------------------------------------------------------------- session effect
 
 def session_effect(pre: dict | None, post: dict | None) -> dict | None:
-    """What this visit's cleaning or debridement did, from its PRE and POST photos."""
-    if not (usable(pre) and usable(post)):
+    """What this visit's cleaning or debridement did, from its PRE and POST photos (None if taken days apart)."""
+    if not (usable(pre) and usable(post)) or not same_visit(pre, post):
         return None
     out: dict = {}
     if pre.get("area_cm2") and post.get("area_cm2"):
@@ -114,10 +131,20 @@ def session_effect(pre: dict | None, post: dict | None) -> dict | None:
 # --------------------------------------------------------------------------- visit-to-visit healing
 
 def healing_series(treatments: list[dict]) -> tuple[str, list[dict]]:
-    """Like-for-like photos across treatments: POST photos if the current treatment has one, else PRE photos."""
+    """Like-for-like photos across treatments, oldest first. "post": after-cleaning photos, used when the current
+    treatment has one and there is an earlier one to compare it with. "pre": the wound as found, which is every
+    PRE photo and every POST photo taken days after its visit."""
+    cleaned, found = [], []
+    for t in treatments:
+        pre, post = t.get("pre"), t.get("post")
+        if usable(pre):
+            found.append(pre)
+        if usable(post):
+            (cleaned if same_visit(pre, post) else found).append(post)
     current = treatments[-1] if treatments else {}
-    phase = "post" if usable(current.get("post")) else "pre"
-    return phase, [t[phase] for t in treatments if usable(t.get(phase))]
+    if usable(current.get("post")) and same_visit(current.get("pre"), current.get("post")) and len(cleaned) >= 2:
+        return "post", cleaned
+    return "pre", found
 
 
 def _compare(a: dict, b: dict) -> dict:
@@ -155,6 +182,25 @@ def trajectory(change: dict, noise: dict | None = None) -> tuple[str | None, str
         t = n["tissue_points"]
         return ("improving" if d < -t else "deteriorating" if d > t else "static"), "tissue"
     return None, None
+
+
+def response(pre: dict | None, post: dict | None, noise: dict | None = None) -> dict | None:
+    """What a treatment had done by its POST photo, when that was taken days after the PRE photo: the change, and
+    whether it is improving, static or deteriorating. None for a same-visit POST photo (see session_effect)."""
+    if not (usable(pre) and usable(post)) or same_visit(pre, post):
+        return None
+    out = _compare(pre, post)
+    out["trajectory"], out["basis"] = trajectory(out, noise)
+    return out
+
+
+def depth_change(treatments: list[dict]) -> dict | None:
+    """The depth the clinician probed at this visit (a photo cannot show depth), beside the last one recorded."""
+    depths = [(t.get("assessment") or {}).get("depth_cm") for t in treatments]
+    if not depths or depths[-1] is None:
+        return None
+    earlier = [d for d in depths[:-1] if d is not None]
+    return {"depth_cm": depths[-1], **({"previous_cm": earlier[-1]} if earlier else {})}
 
 
 def four_week_check(series: list[dict], wound_type: str | None) -> dict | None:
@@ -228,7 +274,9 @@ def progress(treatments: list[dict], wound_type: str | None = None, exudate_leve
     heal = healing(treatments, wound_type)
     return {
         "session": session_effect(current.get("pre"), current.get("post")),
+        "response": response(current.get("pre"), current.get("post")),
         "healing": heal,
+        "depth": depth_change(treatments),
         "push": push_score(current.get("post") if usable(current.get("post")) else current.get("pre"), exudate_level),
         "flags": progress_flags(heal, wound_type),
     }

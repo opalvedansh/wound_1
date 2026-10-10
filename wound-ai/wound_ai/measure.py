@@ -9,14 +9,21 @@ Limits you must state in the report and in validation:
 * Accurate only where the wound lies roughly in the marker's plane. Heels, toes
   and other curved sites can be under-estimated; validate against manual tracing.
 * Area only, no depth. Depth needs a probe or a depth sensor.
-* If the marker is not detected, NO measurement is reported. Never guess a scale.
+* Without the marker, a size is reported only from something that was measured: the distance the phone read when
+  it took the photo (distance_calibration), or the wound's length the clinician measured with a ruler
+  (length_calibration). Never guess a scale: a photo with none of these gets NO measurement.
 """
 from __future__ import annotations
 
+import io
+import json
+import math
+import re
 from dataclasses import asdict, dataclass
 
 import cv2
 import numpy as np
+from PIL import Image
 
 ARUCO_DICT = "DICT_4X4_50"
 
@@ -57,6 +64,107 @@ def find_marker(img_rgb: np.ndarray, marker_mm: float = 20.0, marker_id: int | N
     H = cv2.getPerspectiveTransform(c, dst)
     side_px = float(np.mean([np.linalg.norm(c[i] - c[(i + 1) % 4]) for i in range(4)]))
     return Calibration(homography=H, marker_px_side=side_px, marker_id=int(ids[k]))
+
+
+# What a phone can plausibly report for a wound photo: outside these the reading is refused, not used.
+DISTANCE_MM = (80.0, 1000.0)
+HFOV_DEG = (20.0, 120.0)
+LENGTH_CM = (0.2, 60.0)  # a wound length a clinician could have measured with a ruler
+MAX_TILT_DEG = 60.0  # a surface seen more edge-on than this is too foreshortened to outline or measure
+
+
+def surface_tilt_deg(normal) -> float | None:
+    """How far the surface faces away from the camera, from its normal (photo axes: x right, y down, z into the
+    scene). None when the normal is not three finite numbers with a length."""
+    try:
+        n = np.array(normal, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if n.shape != (3,) or not np.isfinite(n).all() or np.linalg.norm(n) < 1e-9:
+        return None
+    return math.degrees(math.acos(min(1.0, abs(n[2]) / np.linalg.norm(n))))
+
+
+def valid_reading(reading) -> bool:
+    """A phone's distance reading that could be real. Anything else is refused rather than measured with."""
+    def within(key: str, lo: float, hi: float) -> bool:
+        v = reading.get(key)
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi
+
+    if not (isinstance(reading, dict) and within("distance_mm", *DISTANCE_MM) and within("hfov_deg", *HFOV_DEG)):
+        return False
+    if reading.get("normal") is None:
+        return True
+    tilt = surface_tilt_deg(reading["normal"])
+    return tilt is not None and tilt <= MAX_TILT_DEG
+
+
+def phone_reading(photo: bytes) -> dict | None:
+    """The distance reading the phone app wrote into the photo it took: JSON under "woundScale" in the EXIF user
+    comment, so the reading travels with its photo through offline storage and upload.
+
+    Only the app's own reading counts. A camera's generic EXIF subject distance is a focus estimate, not a
+    measurement, and is never used.
+    """
+    try:
+        comment = Image.open(io.BytesIO(photo)).getexif().get_ifd(0x8769).get(0x9286)
+        text = comment.decode("utf-8", "ignore") if isinstance(comment, bytes) else str(comment or "")
+        text = text.replace("\0", "")  # the comment's character-set header, and UTF-16 padding if a writer used it
+        found = re.search(r"\{.*\}", text, re.S)
+        reading = json.loads(found.group(0)).get("woundScale") if found else None
+    except Exception:  # no EXIF, not JSON, a truncated file: the photo simply carries no reading
+        return None
+    return reading if valid_reading(reading) else None
+
+
+def distance_calibration(distance_mm: float, hfov_deg: float, image_size: tuple[int, int],
+                         normal: tuple[float, float, float] | None = None) -> Calibration:
+    """The scale of a photo with no sticker, from what the phone measured when it took the photo (its depth sensor
+    or AR tracking): the distance to the surface at the photo's centre, the camera's field of view across the
+    photo's width, and the direction the surface faces (`normal`, in photo axes: x right, y down, z into the scene).
+
+    The wound is taken to lie on that flat surface, so each pixel's ray is followed to the plane and the result is a
+    homography from pixels to millimetres on it, as the sticker gives. That corrects for the phone being tilted.
+    Without `normal` the surface is taken to face the camera squarely, which is right only if it did.
+    """
+    w, h = image_size
+    focal = w / (2 * math.tan(math.radians(hfov_deg) / 2))
+    n = np.array(normal if normal is not None else (0.0, 0.0, 1.0), dtype=float)
+    n /= np.linalg.norm(n)
+    centre = np.array([0.0, 0.0, distance_mm])
+    # Millimetre axes on the surface: e1 along the photo's x as far as the surface allows, e2 across it.
+    e1 = np.array([1.0, 0.0, 0.0]) - n[0] * n
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(n, e1)
+    px = np.array([[-100, -100], [100, -100], [100, 100], [-100, 100]], np.float32)
+    on_surface = []
+    for u, v in px:
+        ray = np.array([u / focal, v / focal, 1.0])
+        point = ray * (n @ centre) / (n @ ray)
+        on_surface.append(((point - centre) @ e1, (point - centre) @ e2))
+    H = cv2.getPerspectiveTransform(px + np.float32([w / 2, h / 2]), np.array(on_surface, np.float32))
+    return Calibration(homography=H.astype(np.float64), marker_px_side=0.0, marker_id=-1)
+
+
+def length_calibration(mask: np.ndarray, length_cm) -> Calibration | None:
+    """The scale of a photo with no sticker and no phone reading, from the wound's longest length as the clinician
+    measured it with a ruler: the largest outlined region is taken to be that long, which fixes how much each pixel
+    covers. So the area and width are only as good as that one measurement and the outline, and, as with any
+    single scale, the phone is taken to have been held square to the wound.
+    """
+    if isinstance(length_cm, bool) or not isinstance(length_cm, (int, float)) \
+            or not LENGTH_CM[0] <= length_cm <= LENGTH_CM[1]:
+        return None
+    n_lab, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8))
+    if n_lab < 2:
+        return None
+    largest = (labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    cnt = max(cv2.findContours(largest, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0], key=len)
+    (_, _), (a, b), _ = cv2.minAreaRect(cnt)  # the same longest dimension measure_wound reports
+    if max(a, b) < 2:
+        return None
+    mm_per_px = 10.0 * length_cm / max(a, b)
+    return Calibration(homography=np.diag([mm_per_px, mm_per_px, 1.0]), marker_px_side=0.0, marker_id=-1)
 
 
 def region_area_mm2(region: np.ndarray, H: np.ndarray) -> float:

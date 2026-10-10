@@ -113,6 +113,7 @@ function setup(
   const model = {
     questions: jest.fn(async () => CORE),
     followUps: jest.fn(async () => FOLLOW_UPS),
+    check: jest.fn(async () => ({ quality: { ok: true, usable: true, issues: [] }, marker_found: false, phone_reading: null })),
     analyze: jest.fn(async () => {
       if (options.modelFails) throw new Error('model asleep');
       return options.findings ?? OK;
@@ -199,6 +200,17 @@ describe('VisitsService.create', () => {
     const [path] = storage.upload.mock.calls[0] as unknown as [string];
     expect(storage.remove).toHaveBeenCalledWith(path);
     expect(jobs.enqueue).not.toHaveBeenCalled();
+  });
+});
+
+describe('VisitsService.photoCheck', () => {
+  it('sends a real image to the model and refuses anything else', async () => {
+    const { service, model } = setup();
+    await expect(service.photoCheck({ buffer: jpeg, size: jpeg.length })).resolves.toEqual({ quality: { ok: true, usable: true, issues: [] }, marker_found: false, phone_reading: null });
+    expect(model.check).toHaveBeenCalledWith({ buffer: jpeg, mimetype: 'image/jpeg' });
+    await expect(service.photoCheck(undefined)).rejects.toThrow('Add a photo');
+    await expect(service.photoCheck({ buffer: Buffer.from('not an image'), size: 12 })).rejects.toThrow('JPEG or PNG');
+    expect(model.check).toHaveBeenCalledTimes(1);
   });
 });
 

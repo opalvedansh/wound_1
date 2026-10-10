@@ -17,13 +17,18 @@ import re
 from datetime import datetime, timezone
 
 from .intake import FOOT_SITES, LEG_AND_FOOT_SITES, SPECIAL_BURN_SITES
-from .progress import FOUR_WEEK_TARGET, FOUR_WEEK_WINDOW, progress_flags, trajectory, within_noise
+from .progress import FOUR_WEEK_TARGET, FOUR_WEEK_WINDOW, progress_flags, same_visit, trajectory, within_noise
 
 DISCLAIMER = ("AI-generated draft for review by a qualified clinician. It is not a diagnosis and must not be used "
               "to start, stop or change treatment without clinical assessment.")
 
 # The red-flag rules' version (docs/clinical_signoff.md section 5): "-unsigned" until a clinician signs them off.
 FLAGS_VERSION = "flags-0.1-unsigned"
+# Placeholders until measured on real phones: how uneven the surface the phone measured may be before the size is
+# doubted, and how far its size may be from the sticker's (same photo) before that is pointed out.
+CURVED_SURFACE_MM = 5.0
+PHONE_STICKER_TOLERANCE_PCT = 10.0
+LENGTH_TOLERANCE_PCT = 15.0  # measured length against the clinician's ruler length; a ruler reading is rough itself
 UNCERTAIN_BELOW = 0.70  # calibrated probability below which a classification is reported as uncertain
 ABPI_LOW = 0.8  # below: arterial or mixed disease possible (guidelines differ; clinician sets the threshold)
 ABPI_HIGH = 1.3  # above: arteries may be calcified, so the reading can be falsely reassuring
@@ -114,7 +119,30 @@ def red_flags(f: dict) -> list[dict]:
     if conf is not None and conf < UNCERTAIN_BELOW:
         add("review", "Model is uncertain about the wound type: clinician to classify.")
     if f.get("measurement") is None:
-        add("review", "Size not measured (calibration sticker not detected or no wound region found).")
+        add("review", "Size not measured (no calibration sticker, phone distance reading or entered wound length, "
+                      "or no wound region found).")
+    elif f["measurement"].get("method") == "phone_distance":
+        reading = f.get("phone_reading") or {}
+        how = ("the phone's tilt was corrected from the surface it measured, taking the skin around the wound as flat"
+               if reading.get("normal") is not None else "it is right only if the phone was held square to the wound")
+        add("review", f"Size is from the phone's distance reading, not a calibration sticker: {how}. "
+                      "Check it against a ruler.")
+        if (reading.get("surface_rms_mm") or 0) > CURVED_SURFACE_MM:
+            add("review", f"The skin around the wound is curved (about {reading['surface_rms_mm']:.0f} mm from "
+                          "flat), so the size is likely under-estimated.")
+    elif f["measurement"].get("method") == "entered_length":
+        add("review", f"Size is scaled from the wound length entered with the photo ({f['intake'].get('measured_length_cm')} "
+                      "cm), not a calibration sticker: the area and width follow the model's outline and are right "
+                      "only if the phone was held square to the wound.")
+    check = f.get("measurement_check") or {}
+    if abs(check.get("length_vs_entered_pct", 0)) > LENGTH_TOLERANCE_PCT:
+        add("review", f"The measured length ({check['measured_length_cm']} cm) is "
+                      f"{abs(check['length_vs_entered_pct']):.0f}% {'longer' if check['length_vs_entered_pct'] > 0 else 'shorter'} "
+                      f"than the length entered with the photo ({check['entered_length_cm']} cm): check the outline and the ruler.")
+    if abs(check.get("phone_vs_sticker_pct", 0)) > PHONE_STICKER_TOLERANCE_PCT:
+        add("review", f"The phone's distance reading gives an area {abs(check['phone_vs_sticker_pct']):.0f}% "
+                      f"{'larger' if check['phone_vs_sticker_pct'] > 0 else 'smaller'} than the sticker "
+                      f"({check['phone_area_cm2']} against {check['sticker_area_cm2']} cm²). The sticker's size is used.")
     warned = [QUALITY_WORDS[w] for w in (f.get("quality") or {}).get("warnings", []) if w in QUALITY_WORDS]
     if warned:
         add("review", f"Photo quality ({', '.join(warned)}): the outline, size and tissue estimates may be less "
@@ -154,6 +182,15 @@ def _fmt_class(entry: dict | None) -> str:
         alts = ", ".join(f"{LABELS.get(k, k)} {v:.0%}" for k, v in entry.get("top", [])[:3])
         return f"UNCERTAIN (top estimates: {alts})"
     return f"{label} (model confidence {p:.0%})"
+
+
+def redness_line(r: dict | None) -> str | None:
+    """The colour-based redness of the skin around the wound, worded as the hint it is."""
+    if not r:
+        return None
+    seen = {"none": "none seen", "mild": "mild", "marked": "marked"}[r["level"]]
+    return (f"- Redness around the wound (from colour, a hint only): {seen}. Redness shows less on darker skin: "
+            "check warmth, swelling and pain on examination.")
 
 
 def template_narrative(f: dict) -> str:
@@ -207,7 +244,10 @@ def render_report(f: dict, narrative: str | None = None) -> str:
         lines.append(f"- {SEVERITY_NAMES.get(k, k)}: {_fmt_class(v)}")
     if m:
         lines.append(f"- Size: area {m['area_cm2']} cm², length {m['length_cm']} cm, width {m['width_cm']} cm, "
-                     f"perimeter {m['perimeter_cm']} cm ({m['n_regions']} region(s)). Depth not measurable from a photo.")
+                     f"perimeter {m['perimeter_cm']} cm ({m['n_regions']} region(s)"
+                     + {"phone_distance": "; scale from the phone's distance reading",
+                        "entered_length": "; scale from the wound length entered with the photo"}.get(m.get("method"), "")
+                     + "). Depth not measurable from a photo.")
     else:
         lines.append("- Size: not measured.")
     if t:
@@ -218,6 +258,8 @@ def render_report(f: dict, narrative: str | None = None) -> str:
     if not t and f.get("tissue_pct_uncertain"):
         lines.append(f"- Wound bed tissue: UNCERTAIN (model confidence {f['tissue_confidence']:.0%}; estimate "
                      + ", ".join(f"{k} {v}%" for k, v in f["tissue_pct_uncertain"].items()) + "). Assess on examination.")
+    if redness_line(f.get("periwound_redness")):
+        lines.append(redness_line(f.get("periwound_redness")))
     if f.get("change"):
         c = f["change"]
         lines.append(f"- Change: previous area {c.get('previous_area_cm2')} cm², "
@@ -333,6 +375,9 @@ def treatment_narrative(prog: dict, care: dict) -> str:
     if "nonviable_removed_points" in s:
         parts.append(f"This session reduced non-viable tissue from {s['nonviable_before_pct']}% to "
                      f"{s['nonviable_after_pct']}%.")
+    r = prog.get("response") or {}
+    if r.get("trajectory"):
+        parts.append(f"From the before photo to the after photo of this treatment the wound is {r['trajectory']}.")
     if care.get("suggestions"):
         parts.append("Suggested considerations: " + ", ".join(x["action"] for x in care["suggestions"]) + ".")
     return " ".join(parts)
@@ -353,7 +398,9 @@ def render_treatment_report(req: dict, prog: dict, care: dict, flags: list[dict]
               "## Findings", f"- Wound type: {_fmt_class(req.get('wound_type'))}"]
     for k, v in (req.get("severity") or {}).items():
         lines.append(f"- {SEVERITY_NAMES.get(k, k)}: {_fmt_class(v)}")
-    for name, obs in (("Before treatment", cur.get("pre")), ("After cleaning", cur.get("post"))):
+    later = not same_visit(cur.get("pre"), cur.get("post"))
+    for name, obs in (("Before treatment", cur.get("pre")),
+                      ("After treatment" if later else "After cleaning", cur.get("post"))):
         if not obs:
             continue
         if obs.get("status") != "ok":
@@ -364,6 +411,23 @@ def render_treatment_report(req: dict, prog: dict, care: dict, flags: list[dict]
         t = obs.get("tissue_pct")
         tissue = ("; tissue " + ", ".join(f"{k} {v}%" for k, v in t.items())) if t else ""
         lines.append(f"- {name}: {size}{tissue}")
+    d = prog.get("depth")
+    if d:
+        was = f" (was {d['previous_cm']:g} cm)" if "previous_cm" in d else ""
+        lines.append(f"- Depth, probed by the clinician: {d['depth_cm']:g} cm{was}")
+    else:
+        lines.append("- Depth: not recorded. A photo cannot show depth.")
+    latest = cur.get("post") if (cur.get("post") or {}).get("status") == "ok" else cur.get("pre")
+    if redness_line((latest or {}).get("periwound_redness")):
+        lines.append(redness_line(latest["periwound_redness"]))
+
+    r = prog.get("response")
+    if r:
+        change = _change_line("Before → after", r)
+        lines += ["", "## This treatment (before → after, days apart)",
+                  *([change] if change else []),
+                  f"- {TRAJECTORY_TEXT[r['trajectory']]} (by {r['basis']})" if r.get("trajectory")
+                  else "- Not compared: no size in both photos and no tissue estimate."]
 
     s = prog.get("session")
     if s:
@@ -377,13 +441,14 @@ def render_treatment_report(req: dict, prog: dict, care: dict, flags: list[dict]
     h = prog.get("healing") or {}
     lines += ["", "## Healing"]
     if h.get("trajectory"):
-        which = "after-cleaning" if h["phase"] == "post" else "before-treatment"
-        lines.append(f"- Trajectory: {TRAJECTORY_TEXT[h['trajectory']]} (by {h['basis']}, comparing {which} photos)")
+        which = "after-cleaning photos" if h["phase"] == "post" else "photos of the wound as found"
+        lines.append(f"- Trajectory: {TRAJECTORY_TEXT[h['trajectory']]} (by {h['basis']}, comparing {which})")
         nb = h.get("noise_band")
         if nb:
             lines.append(f"- Noise band: {nb['smaller_pct']:g}% smaller to {nb['larger_pct']:g}% larger counts as no "
                          f"change ({nb['source']})")
-        lines += [x for x in (_change_line("Since last visit", h.get("since_last")),
+        # With a post photo from days later, "since last" is the before → after pair already given above.
+        lines += [x for x in (None if r else _change_line("Since last visit", h.get("since_last")),
                               _change_line("Since first visit", h.get("since_first"))) if x]
         fw = h.get("four_week")
         if fw:

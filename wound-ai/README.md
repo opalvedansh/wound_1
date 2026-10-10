@@ -29,11 +29,12 @@ photo ─► quality gate ─► wound segmentation ─► crop ─► wound-typ
 | `wound_ai/measure.py` | ArUco sticker → homography → area, length, width, perimeter, % change |
 | `wound_ai/intake.py` | Questions the app asks, with adaptive follow-ups (burn, surgical, pressure, diabetic) |
 | `wound_ai/report.py` | Red-flag rules (placeholders for clinical sign-off), template report, LLM guard |
-| `wound_ai/progress.py` | Healing visit to visit (like with like: after-cleaning photos), what a session's debridement did, 4-week check, PUSH |
+| `wound_ai/progress.py` | Healing visit to visit (like with like), what a session's debridement did, the response when the post photo is days later, the clinician's depth, 4-week check, PUSH |
 | `wound_ai/care.py` | Care suggestions from a rule table (TIME framework, contraindications; placeholders for sign-off), the treatment report |
 | `wound_ai/llm.py` | MedGemma loading and summary generation (optional) |
 | `wound_ai/pipeline.py` | `WoundAnalyzer`: everything above, end to end |
 | `scripts/prepare_data.py` | Merge datasets into one manifest; near-duplicate grouping to stop leakage |
+| `scripts/data_audit.py` | Every image under `data/raw` with its status: used (and its split), mask, copy, excluded and why, left out. Writes `reports/data_audit.md` |
 | `scripts/repeatability.py` | Measurement noise from a repeat-photo study (docs/repeatability_study.md); `--write` makes healing use it |
 | `scripts/build_tissue_dataset.py` | The three public tissue datasets mapped to our classes, locked test set, unlabelled pool, clinician agreement |
 | `scripts/pseudo_label.py` | A trained tissue model labels unlabelled photos where it is confident (semi-supervised training) |
@@ -110,6 +111,10 @@ On the clinic's own patients: `docs/validation_study.md`, scored by `scripts/cli
 de-identified `validation` export. More tissue labels: `export_for_labelling.py` → correct in CVAT → `import_labels.py --merge` →
 `tissue_cv.py --manifest data/tissue_manifest_all.csv --teacher-only`.
 
+Final fit: `--final-fit` on `cv.py`, `tissue_cv.py` and `severity_cv.py` trains each model once more on nearly all
+the non-test photos (a fold's model never sees its validation fold) and installs it only if its locked-test score is
+at least the folds' mean. `python scripts/data_audit.py` accounts for every file under `data/raw`.
+
 More data: `notebooks/kaggle_public_cv.ipynb` adds seven public Kaggle wound datasets (attach them as inputs),
 deduplicated against each other and the locked test sets by `scripts/build_public_dataset.py`: about 4,820 photos
 for 7 wound types (burn, pressure, diabetic, venous, surgical, other, no wound) and 2,582 traced outlines.
@@ -122,7 +127,8 @@ curl -H "X-API-Key: change-me" -F image=@photo.jpg \
   -F 'intake={"body_location":"heel","diabetes":"yes","cause":"started_on_its_own"}' localhost:8000/analyze
 ```
 
-`POST /analyze` takes `phase=pre|post` (post: after cleaning, before the dressing, same visit). `POST /treatment-report`
+`POST /analyze` takes `phase=pre|post` (post: after cleaning in the same visit, or the wound days later; the photos'
+dates in `taken_at` tell which). Its result includes `periwound_redness`, a colour-based hint. `POST /treatment-report`
 takes a wound's analysed photos so far (JSON, no images) and returns healing, care suggestions and the treatment's draft;
 see `wound_ai.care.treatment_report`.
 
@@ -152,6 +158,10 @@ results, and serves the web portal.
   Your clinical partner signs them off; bump `RULES_VERSION` on every change.
 - Care suggestions come from the rule table, never from the language model; each names the finding behind it, and
   contraindications (e.g. compression without an ABPI) remove any suggestion they conflict with.
+- A post photo taken days after the pre photo is compared with it (`progress.response`); one taken in the same visit
+  never is, because a freshly cleaned wound often measures larger.
+- Depth is the clinician's probe measurement. Redness from the photo's colour is a hint that no rule uses: it shows
+  less on darker skin.
 - Healing compares like with like (after-cleaning photos), only with the sticker in both, and calls changes inside
   the measurement noise static: a placeholder ±15% until `scripts/repeatability.py --write` saves the band measured
   by a repeat-photo study to `wound_ai/measurement_noise.json`. Every healing result names which one it used.

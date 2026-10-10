@@ -3,6 +3,7 @@ import type {
   AnalyzeResponse,
   IntakeAnswers,
   IntakeQuestion,
+  PhotoCheck,
   PhotoPhase,
   ReviewDecision,
   TreatmentReportRequest,
@@ -11,6 +12,7 @@ import type {
 
 const ANALYZE_TIMEOUT_MS = 60_000; // a hosted model that has gone to sleep can take most of this to start
 const QUESTIONS_TIMEOUT_MS = 15_000;
+const CHECK_TIMEOUT_MS = 20_000; // no model runs, but the photo still has to be sent
 const CORE_QUESTIONS_TTL_MS = 10 * 60_000;
 
 export interface ModelReview {
@@ -70,6 +72,20 @@ export class ModelClient {
       ANALYZE_TIMEOUT_MS,
     );
     return (await res.json()) as AnalyzeResponse;
+  }
+
+  /** The photo's quality and whether the calibration sticker is in it, without running any model. */
+  async check(photo: { buffer: Buffer; mimetype: string }): Promise<PhotoCheck> {
+    const res = await this.call(
+      '/check',
+      () => {
+        const form = new FormData();
+        form.append('image', new Blob([new Uint8Array(photo.buffer)], { type: photo.mimetype }), 'photo');
+        return { method: 'POST', body: form };
+      },
+      CHECK_TIMEOUT_MS,
+    );
+    return (await res.json()) as PhotoCheck;
   }
 
   /** Healing, care suggestions and the draft for a treatment, from findings already stored (no photos sent). */

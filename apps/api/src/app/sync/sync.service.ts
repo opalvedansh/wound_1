@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import type { Case, Patient, RevisitAssessment, TherapyDetails } from '@antigravity-project-spec-pack/domain';
-import type { Care, IntakeAnswers, Progress } from '@antigravity-project-spec-pack/domain/wound-model';
+import { photoFindings, type AnalyzeResponse, type Care, type IntakeAnswers, type Progress } from '@antigravity-project-spec-pack/domain/wound-model';
 import {
   SYNC_ENTITIES,
   type PullResponse,
@@ -68,6 +68,7 @@ const TreatmentRecord = z.object({
       pressureStage: z.string().max(100).optional().default(''),
       burnDepth: z.string().max(100).optional().default(''),
       wagnerGrade: z.string().max(100).optional().default(''),
+      depthCm: z.number().min(0).max(50).optional(),
       woundAppearanceTrend: z.enum(['Improving', 'Static', 'Deteriorating']).optional(),
       responses: answers,
     })
@@ -145,6 +146,16 @@ export function intakeFromApp(location: string, a: Partial<RevisitAssessment> | 
     cause: CAUSES.find(([re]) => re.test(type))?.[1] ?? 'unknown',
     ...(typeof a?.pain === 'number' ? { pain: a.pain } : {}),
   } as IntakeAnswers;
+}
+
+/**
+ * Adds the wound's length by ruler, typed in with a photo, to the answers the model gets: it scales its outline
+ * from it when the photo has nothing else to measure with. A form field arrives as text; anything that isn't a
+ * positive number is left out (the model decides whether the length is believable).
+ */
+export function withMeasuredLength(intake: IntakeAnswers, raw: unknown): IntakeAnswers {
+  const length = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
+  return typeof length === 'number' && Number.isFinite(length) && length > 0 ? { ...intake, measured_length_cm: length } : intake;
 }
 
 /** Offline-first sync for the mobile app: field-level merge on push, incremental pull. */
@@ -360,6 +371,7 @@ export class SyncService {
           pressureStage: a.pressureStage || null,
           burnDepth: a.burnDepth || null,
           wagnerGrade: a.wagnerGrade || null,
+          depthCm: a.depthCm ?? null,
           trend: a.woundAppearanceTrend ?? null,
           responses: (a.responses ?? undefined) as Prisma.InputJsonValue | undefined,
         };
@@ -472,8 +484,8 @@ export class SyncService {
                   select: {
                     phaseType: true,
                     assessment: true,
-                    image: { select: { imageUrl: true, thumbPath: true } },
-                    aiResult: { select: { id: true, status: true, area: true, urgent: true, reviewStatus: true, findings: true, progress: true, care: true } },
+                    image: { select: { imageUrl: true, thumbPath: true, takenAt: true } },
+                    aiResult: { select: { id: true, status: true, area: true, urgent: true, reviewStatus: true, findings: true, progress: true, care: true, createdAt: true } },
                   },
                 },
                 case: { select: { woundType: true, comorbidities: true } },
@@ -540,8 +552,8 @@ export class SyncService {
           select: {
             phaseType: true;
             assessment: true;
-            image: { select: { imageUrl: true; thumbPath: true } };
-            aiResult: { select: { id: true; status: true; area: true; urgent: true; reviewStatus: true; findings: true; progress: true; care: true } };
+            image: { select: { imageUrl: true; thumbPath: true; takenAt: true } };
+            aiResult: { select: { id: true; status: true; area: true; urgent: true; reviewStatus: true; findings: true; progress: true; care: true; createdAt: true } };
           };
         };
         case: { select: { woundType: true; comorbidities: true } };
@@ -554,8 +566,11 @@ export class SyncService {
     const a = pre?.assessment;
     const url = (img: { imageUrl: string; thumbPath: string | null } | null | undefined) => (img ? urls.get(img.thumbPath ?? img.imageUrl) ?? null : null);
     const ai = pre?.aiResult;
-    const findings = ai?.findings as { wound_type?: { label?: string } } | null;
-    const healing = (ai?.progress as Progress | null)?.healing;
+    const findings = ai?.findings as AnalyzeResponse | null;
+    const postFindings = post?.aiResult?.findings as AnalyzeResponse | null | undefined;
+    const progress = ai?.progress as Progress | null | undefined;
+    const healing = progress?.healing;
+    const takenAt = (p: typeof pre) => (p?.image?.takenAt ?? p?.aiResult?.createdAt)?.toISOString() ?? null;
     // Suggestions reach the app only once a clinician has approved or edited the draft.
     const approved = ai?.reviewStatus === 'approved' || ai?.reviewStatus === 'edited';
     const care = approved ? (ai?.care as Care | null) : null;
@@ -582,6 +597,7 @@ export class SyncService {
           pressureStage: a.pressureStage ?? '',
           burnDepth: a.burnDepth ?? '',
           wagnerGrade: a.wagnerGrade ?? '',
+          ...(a.depthCm !== null ? { depthCm: a.depthCm } : {}),
           ...(a.trend ? { woundAppearanceTrend: a.trend as RevisitAssessment['woundAppearanceTrend'] } : {}),
           ...(a.responses ? { responses: a.responses as unknown as RevisitAssessment['responses'] } : {}),
         }
@@ -612,6 +628,12 @@ export class SyncService {
               trajectory: healing?.trajectory ?? null,
               areaReductionSinceFirstPct: healing?.since_first?.percent_area_reduction ?? null,
               suggestions: care ? care.suggestions.map((s) => ({ action: s.action, text: s.text })) : null,
+              // The outlines stay on the server: the phone shows the findings in words.
+              findings: findings ? photoFindings(findings) : null,
+              postFindings: postFindings ? photoFindings(postFindings) : null,
+              takenAt: takenAt(pre),
+              postTakenAt: post?.image ? takenAt(post) : null,
+              progress: progress ?? null,
             }
           : null,
       },
@@ -621,7 +643,11 @@ export class SyncService {
   // ---------------------------------------------------------------- photos
 
   /** A photo taken in the app, sent after its treatment synced. Both photos are analysed by the model. */
-  async photo(ctx: ClinicContext, treatmentId: string, phaseRaw: string, photo: PhotoUpload | undefined) {
+  async photo(ctx: ClinicContext, treatmentId: string, phaseRaw: string, photo: PhotoUpload | undefined, measuredLengthCm?: unknown, takenAtRaw?: unknown) {
+    // When the phone took the photo, which can be days before it uploads. A date that is missing, unreadable or
+    // in the future is left out, and the upload time stands in.
+    const taken = typeof takenAtRaw === 'string' ? new Date(takenAtRaw) : null;
+    const takenAt = taken && !Number.isNaN(taken.getTime()) && taken.getTime() <= Date.now() + 5 * 60_000 ? taken : undefined;
     const phase = phaseRaw.toUpperCase() === 'POST' ? 'POST' : 'PRE';
     let intake: IntakeAnswers = {} as IntakeAnswers;
     {
@@ -637,7 +663,7 @@ export class SyncService {
         t?.case.comorbidities ?? [],
       );
     }
-    const result = await this.visits.attachSyncedPhoto(ctx, treatmentId, phase, photo, intake);
+    const result = await this.visits.attachSyncedPhoto(ctx, treatmentId, phase, photo, withMeasuredLength(intake, measuredLengthCm), takenAt);
     // Other devices learn the photo is stored on their next pull.
     await this.prisma.treatment.update({ where: { id: treatmentId }, data: { version: { increment: 1 } } });
     return result;

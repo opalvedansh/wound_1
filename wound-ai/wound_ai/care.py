@@ -17,7 +17,7 @@ review stores the rule ids it accepted or declined.
 from __future__ import annotations
 
 from .intake import FOOT_SITES, LEG_AND_FOOT_SITES
-from .progress import nonviable, progress, usable
+from .progress import nonviable, progress, same_visit, usable
 from .report import DANGER, render_treatment_report
 
 # Stays "-unsigned" until a clinician signs docs/clinical_signoff.md; then "care-1.0", with the sign-off recorded there.
@@ -100,7 +100,7 @@ def _tissue(c: _Ctx, out: list, checks: list):
         return
     if c.nonviable < NONVIABLE_DEBRIDE_PCT:
         return
-    if usable(c.post):
+    if usable(c.post) and same_visit(c.pre, c.post):
         out.append(_s("T2", "T", DEBRIDEMENT, "Consider continuing debridement at the next visit.",
                       [f"non-viable tissue still {c.nonviable}% after this session"]))
     else:

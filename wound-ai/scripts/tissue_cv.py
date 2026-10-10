@@ -43,6 +43,8 @@ from cv import PY, gpu_count, in_parallel, mean_sd, run  # noqa: E402
 from wound_ai.data import IGNORE_INDEX, TISSUE_CLASSES  # noqa: E402
 
 PSEUDO_SECONDS_PER_PHOTO = 0.25  # outline + tissue model on a T4, measured order of magnitude
+# The final fit holds out one fold of 10: with about 200 labelled photos that leaves about 20 to stop on.
+FINAL_FOLDS = 10
 
 
 def parse():
@@ -63,6 +65,9 @@ def parse():
     p.add_argument("--student-epochs", type=int, default=40)
     p.add_argument("--student-patience", type=int, default=8)
     p.add_argument("--threshold", type=float, default=0.9, help="teacher confidence needed for a pseudo-label")
+    p.add_argument("--final-fit", action="store_true",
+                   help="train a teacher once more on all but 1/10 of the labelled photos and install it if its "
+                        "locked-test Dice over the trusted classes is at least the folds' mean")
     p.add_argument("--min-train-photos", type=int, default=15,
                    help="classes in fewer training photos are never pseudo-labelled nor trusted")
     p.add_argument("--min-test-photos", type=int, default=10, help="classes in fewer test photos are not trusted")
@@ -244,13 +249,37 @@ def main():
     import torch
 
     best = max(folds_out, key=lambda r: max(r["teacher_val_dice"] or 0, r["student_val_dice"] or 0))
+    source, final = fd[best["fold"]] / "kept/tissue.pt", None
+    if a.final_fit:
+        # A fold's model never sees its validation fold. This one sees nearly every labelled photo, and is judged on
+        # the classes the folds earned trust on (all scored classes if none did).
+        d = out / "final"
+        d.mkdir(exist_ok=True)
+        n = 2 if a.smoke else FINAL_FOLDS
+        if in_parallel([("final teacher", train_cmd(a, 0, n, d / "teacher", weights, a.boundary,
+                                                    1 if a.smoke else a.teacher_epochs, a.teacher_patience),
+                         d / "teacher/log.txt", d / "teacher/.done")], gpus)[0]:
+            sys.exit("the final fit failed. Run the same command again.")
+        in_parallel([("test final", [PY, "scripts/evaluate.py", "--manifest", a.manifest, "--ckpt-dir", str(d / "teacher"),
+                                     "--use-gt-mask", "--group-cols", "source", "--out", str(d / "eval_test.json")],
+                      d / "eval_log.txt", d / ".evaluated")], gpus, quiet=True)
+        t = json.loads((d / "eval_test.json").read_text())["components"].get("tissue", {})
+        dice = {c: v[0] for c, v in (t.get("dice_per_class") or {}).items()}
+        judged = [c for c in (trusted or per_class) if dice.get(c) is not None and per_class[c]["test_dice"]["mean"] is not None]
+        score = round(float(np.mean([dice[c] for c in judged])), 4) if judged else None
+        folds_mean = round(float(np.mean([per_class[c]["test_dice"]["mean"] for c in judged])), 4) if judged else None
+        final = {"test_dice": dice, "judged_on": judged, "mean_dice": score, "folds_mean": folds_mean,
+                 "installed": score is not None and score >= folds_mean}
+        if final["installed"]:
+            source = d / "teacher/tissue.pt"
     (out / "best").mkdir(exist_ok=True)
-    ck = torch.load(fd[best["fold"]] / "kept/tissue.pt", map_location="cpu", weights_only=False)
+    ck = torch.load(source, map_location="cpu", weights_only=False)
     ck["config"]["trusted_classes"] = trusted
-    ck["cv"] = {"folds": folds, "per_class": per_class, "fold": best["fold"], "kept": best["kept"]}
+    ck["cv"] = {"folds": folds, "per_class": per_class, "fold": best["fold"], "kept": best["kept"],
+                **({"final_fit": final} if final else {})}
     torch.save(ck, out / "best/tissue.pt")
     summary = {"folds": folds, "weights": weights, "rare": rare, "per_fold": folds_out, "per_class": per_class,
-               "trusted_classes": trusted, "best_fold": best}
+               "trusted_classes": trusted, "best_fold": best, **({"final_fit": final} if final else {})}
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
 
     def fmt(ms):
@@ -271,7 +300,12 @@ def main():
     md += [f"| {r['fold'] + 1} | {dash(r['teacher_val_dice'], '{:.3f}')} | {dash(r['student_val_dice'], '{:.3f}')} | "
            f"{r['kept']} | {dash(r['pseudo_labelled'])} | {dash(r['test_nonviable_error'], '{:.1f}')} |"
            for r in folds_out]
-    md += ["", f"Installed model: fold {best['fold'] + 1} ({best['kept']}), trusted on: {', '.join(trusted) or 'none'}."]
+    which = f"fold {best['fold'] + 1} ({best['kept']})"
+    if final:
+        md += ["", f"Final fit on all but 1/{FINAL_FOLDS} of the labelled photos: mean test Dice {dash(final['mean_dice'], '{:.3f}')} "
+                   f"over {', '.join(final['judged_on']) or 'no class'} (folds {dash(final['folds_mean'], '{:.3f}')})."]
+        which = "the final fit" if final["installed"] else f"{which}; the final fit scored below the folds"
+    md += ["", f"Installed model: {which}, trusted on: {', '.join(trusted) or 'none'}."]
     (out / "summary.md").write_text("\n".join(md) + "\n")
     print("\n".join(md), flush=True)
 

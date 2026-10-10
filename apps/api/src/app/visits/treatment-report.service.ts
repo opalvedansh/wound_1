@@ -28,6 +28,7 @@ const treatmentSelect = {
     select: {
       phaseType: true,
       assessment: true,
+      image: { select: { takenAt: true } },
       aiResult: { select: { id: true, status: true, findings: true, intake: true, createdAt: true, reviewStatus: true, review: { select: { decision: true } } } },
     },
   },
@@ -40,7 +41,10 @@ const recorded = (v: string | null | undefined) => (v && v !== 'Not recorded' ? 
 
 const toObservation = (phase: PhaseRow | undefined): Observation | null => {
   const r = phase?.aiResult;
-  return r && ANALYSED.includes(r.status) && r.findings ? observation(r.findings as unknown as AnalyzeResponse, r.createdAt.toISOString()) : null;
+  if (!r || !ANALYSED.includes(r.status) || !r.findings) return null;
+  // When the phone took the photo, not when it reached the server: the gap between the two photos of a treatment
+  // tells a post photo taken after cleaning from one taken days later.
+  return observation(r.findings as unknown as AnalyzeResponse, (phase?.image?.takenAt ?? r.createdAt).toISOString());
 };
 
 const toAssessment = (a: PhaseRow['assessment']): CareAssessment | null =>
@@ -52,6 +56,7 @@ const toAssessment = (a: PhaseRow['assessment']): CareAssessment | null =>
         edge_condition: recorded(a.edgeCondition),
         periwound_condition: recorded(a.periwoundCondition),
         pain_level: a.painLevel,
+        depth_cm: a.depthCm ?? null,
       }
     : null;
 

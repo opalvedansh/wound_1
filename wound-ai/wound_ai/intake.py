@@ -36,6 +36,9 @@ CORE_QUESTIONS = [
      "used_by": ["report"]},
     {"id": "abpi", "text": "ABPI (ankle-brachial pressure index), if measured. Leave blank if not.", "type": "number",
      "used_by": ["blood-flow flag for leg and foot ulcers"]},
+    {"id": "measured_length_cm", "text": "Longest length of the wound measured with a ruler (cm), if measured. "
+                                         "Leave blank if not.", "type": "number",
+     "used_by": ["size, when the photo has no calibration sticker and no phone distance reading"]},
 ]
 
 # Body sites where the flowcharts apply the diabetic-foot rule (Chart 1) and the blood-flow check (Charts 2 and 3).

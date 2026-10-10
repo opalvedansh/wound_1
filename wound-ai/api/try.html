@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wound assessment: try a photo</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; padding: 24px 16px; max-width: 1100px; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  form { display: grid; gap: 12px; max-width: 560px; }
+  label { display: grid; gap: 4px; font-weight: 600; }
+  label.row { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+  input[type=password], input[type=number], textarea, select { font: inherit; padding: 6px 8px; }
+  details label { margin-top: 8px; }
+  textarea { font-family: ui-monospace, monospace; font-size: 13px; }
+  button { font: inherit; padding: 8px 16px; justify-self: start; }
+  #status { margin: 16px 0; min-height: 1.5em; }
+  #result { display: grid; gap: 24px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+  @media (max-width: 760px) { #result { grid-template-columns: 1fr; } }
+  img { max-width: 100%; height: auto; display: block; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; margin: 0; }
+  details { margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>Wound assessment: try a photo</h1>
+<form id="form">
+  <label>API key (X-API-Key)<input type="password" id="key" required autocomplete="off"></label>
+  <label>Photo<input type="file" id="image" accept="image/*" required></label>
+  <label>Intake answers (JSON; diabetes and cause are required)
+    <textarea id="intake" rows="3">{"diabetes": "no", "cause": "injury_cut_or_fall"}</textarea></label>
+  <label>Phase<select id="phase"><option>pre</option><option>post</option></select></label>
+  <label class="row"><input type="checkbox" id="tissue" checked>Draw the tissue layers too</label>
+  <details>
+    <summary>Phone distance reading (what the phone app sends when there is no sticker)</summary>
+    <p>For testing only: a size from numbers typed here is only as true as the numbers.</p>
+    <label>Distance to the wound (mm)<input type="number" id="distance" min="80" max="1000" step="any"></label>
+    <label>Camera's field of view across the photo's width (degrees)<input type="number" id="hfov" min="20" max="120" step="any"></label>
+  </details>
+  <button>Analyse</button>
+</form>
+<p id="status" role="status"></p>
+<div id="result" hidden>
+  <div><img id="overlay" alt="The photo with the wound outline drawn on it"><p id="noOverlay"></p></div>
+  <div><pre id="report"></pre><details><summary>Full response</summary><pre id="json"></pre></details></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+$("key").value = sessionStorage.getItem("woundKey") || "";
+
+async function post(path, fields) {
+  const body = new FormData();
+  for (const [k, v] of Object.entries(fields)) body.append(k, v);
+  return fetch(path, { method: "POST", headers: { "X-API-Key": $("key").value }, body });
+}
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const image = $("image").files[0];
+  sessionStorage.setItem("woundKey", $("key").value);
+  $("status").textContent = "Analysing…";
+  $("result").hidden = true;
+  try {
+    const reading = $("distance").value && $("hfov").value
+      ? { scale: JSON.stringify({ distance_mm: +$("distance").value, hfov_deg: +$("hfov").value }) } : {};
+    const [found, drawn] = await Promise.all([
+      post("/analyze", { image, intake: $("intake").value, phase: $("phase").value, ...reading }),
+      post("/analyze/overlay", { image, tissue: $("tissue").checked }),
+    ]);
+    const findings = await found.json();
+    if (!found.ok) throw new Error(`${found.status}: ${JSON.stringify(findings.detail ?? findings)}`);
+    $("report").textContent = findings.report_markdown || "";
+    $("json").textContent = JSON.stringify(findings, null, 1);
+    if (drawn.ok) {
+      $("overlay").src = URL.createObjectURL(await drawn.blob());
+      $("noOverlay").textContent = "";
+    } else {
+      const why = (await drawn.json()).detail || {};
+      $("overlay").removeAttribute("src");
+      $("noOverlay").textContent = `No outline drawn: ${why.detail || drawn.status}. ${(why.issues || []).join(" ")}`;
+    }
+    $("overlay").hidden = !drawn.ok;
+    $("result").hidden = false;
+    $("status").textContent = "";
+  } catch (err) {
+    $("status").textContent = `Failed: ${err.message}`;
+  }
+});
+</script>
+</body>
+</html>

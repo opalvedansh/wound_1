@@ -54,8 +54,16 @@ def parse():
     p.add_argument("--skip-seg", action="store_true")
     p.add_argument("--skip-cls", action="store_true")
     p.add_argument("--out", default="runs/cv")
+    p.add_argument("--final-fit", action="store_true",
+                   help="after the folds, train each model once more on all but 1/20 of the non-test photos (that part "
+                        "decides when to stop and calibrates) and install it if its locked-test score is at least the "
+                        "folds' mean")
     p.add_argument("--smoke", action="store_true", help="debug: tiny run (3 batches, 1 epoch, no pretrained weights)")
     return p.parse_args()
+
+
+# A fold model never sees its validation fold: 20-33% of the training photos. The final fit holds out one fold of 20.
+FINAL_FOLDS = 20
 
 
 def gpu_count() -> int:
@@ -248,16 +256,41 @@ def main():
     summary["seg_cv"] = {k: mean_sd([r[k] for r in summary["seg"]]) for k in ("val_dice", "test_dice", "test_iou")}
     summary["cls_cv"] = {k: mean_sd([r[k] for r in summary["cls"]]) for k in ("val_macro_f1", "test_macro_f1", "test_accuracy", "test_auroc")}
 
+    final: dict = {}
+    if a.final_fit:
+        # The same settings as the folds, on nearly all the non-test photos, scored on the same locked test set.
+        n = 2 if a.smoke else FINAL_FOLDS  # the smoke test's few patients cannot fill 20 folds
+        fits = [(kind, out / f"final/{kind}", cmd, manifest, extra) for kind, cmd, manifest, extra, skip in (
+            ("seg", seg_cmd(a, 0, n, out / "final/seg", ["--resume"]), a.seg_manifest, [], a.skip_seg),
+            ("cls", cls_cmd(a, 0, n, out / "final/cls"), a.cls_manifest, ["--use-gt-mask"], a.skip_cls)) if not skip]
+        for _, d, *_ in fits:
+            d.mkdir(parents=True, exist_ok=True)
+        codes = in_parallel([(f"final {kind}", cmd, d / "log.txt", d / ".done") for kind, d, cmd, _, _ in fits], gpus)
+        if any(codes):
+            sys.exit("the final fit failed. Run the same command again.")
+        in_parallel([(f"test final {kind}", [PY, "scripts/evaluate.py", "--manifest", manifest, "--ckpt-dir", str(d),
+                                             "--group-cols", "source", "--out", str(d / "eval_test.json"), *extra],
+                      d / "eval_log.txt", d / ".evaluated") for kind, d, _, manifest, extra in fits], gpus, quiet=True)
+        for kind, d, *_ in fits:
+            name, metric, cv_key = ("boundary", "dice", "seg_cv") if kind == "seg" else ("wound_type", "macro_f1", "cls_cv")
+            test = (json.loads((d / "eval_test.json").read_text())["components"][name].get(metric) or [None])[0]
+            folds_mean = summary[cv_key][f"test_{metric}"]["mean"]
+            final[kind] = {f"test_{metric}": test, "folds_mean": folds_mean,
+                           "installed": test is not None and folds_mean is not None and test >= folds_mean}
+        summary["final_fit"] = final
+
     # The fold with the best validation score (never chosen on test) is the one to install.
     best = out / "best"
     best.mkdir(exist_ok=True)
     if summary["seg"]:
         b = max(summary["seg"], key=lambda r: r["val_dice"] or 0)
-        shutil.copy(out / f"seg/fold{b['fold']}/boundary.pt", best / "boundary.pt")
+        shutil.copy(out / (f"seg/fold{b['fold']}" if not final.get("seg", {}).get("installed") else "final/seg") / "boundary.pt",
+                    best / "boundary.pt")
         summary["seg_best_fold"] = b
     if summary["cls"]:
         b = max(summary["cls"], key=lambda r: r["val_macro_f1"] or 0)
-        shutil.copy(out / f"cls/fold{b['fold']}/wound_type.pt", best / "wound_type.pt")
+        shutil.copy(out / (f"cls/fold{b['fold']}" if not final.get("cls", {}).get("installed") else "final/cls") / "wound_type.pt",
+                    best / "wound_type.pt")
         summary["cls_best_fold"] = b
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 
@@ -273,6 +306,12 @@ def main():
         md.append(f"| Wound type, macro-F1 | {fmt(summary['cls_cv']['val_macro_f1'])} | {fmt(summary['cls_cv']['test_macro_f1'])} |")
         md.append(f"| Wound type, accuracy | | {fmt(summary['cls_cv']['test_accuracy'])} |")
         md.append(f"| Wound type, AUROC | | {fmt(summary['cls_cv']['test_auroc'])} |")
+    for kind, label in (("seg", "Outline, Dice"), ("cls", "Wound type, macro-F1")):
+        if kind in final:
+            f = final[kind]
+            score = next(v for k, v in f.items() if k.startswith("test_"))
+            md.append(f"| {label}, final fit on all but 1/{FINAL_FOLDS} | | {score:.3f} "
+                      f"({'installed' if f['installed'] else 'below the folds, best fold kept'}) |")
     md += ["", "Per fold:", ""]
     md += [f"- outline fold {r['fold'] + 1}: val Dice {r['val_dice']:.3f}, test Dice {r['test_dice'] or 0:.3f}" for r in summary["seg"]]
     md += [f"- type fold {r['fold'] + 1}: val F1 {r['val_macro_f1']:.3f}, test F1 {r['test_macro_f1'] or 0:.3f}" for r in summary["cls"]]

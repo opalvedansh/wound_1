@@ -31,6 +31,8 @@ export interface Measurement {
   width_cm: number;
   perimeter_cm: number;
   n_regions: number;
+  /** Where the scale came from: the calibration sticker, or the distance the phone measured when it took the photo. */
+  method?: 'sticker' | 'phone_distance';
 }
 
 export interface AreaChange {
@@ -38,6 +40,17 @@ export interface AreaChange {
   /** Positive = smaller than last time. */
   percent_area_reduction?: number;
   days_between?: number;
+}
+
+/**
+ * Redness of the skin around the wound, from the photo's colour: how much redder (CIELAB a*) the skin beside the
+ * wound is than skin further out. A hint only: it shows less on darker skin, and no rule uses it.
+ */
+export interface Redness {
+  delta_a: number;
+  level: 'none' | 'mild' | 'marked';
+  /** The photo's colour cast was corrected from the sticker's grey patch. */
+  white_balanced: boolean;
 }
 
 /** One polygon per wound region; points are [x, y] scaled 0–1 by the photo's width and height. */
@@ -51,6 +64,26 @@ export interface IntakeQuestion {
 }
 
 export type IntakeAnswers = Record<string, string | number>;
+
+/** The distance the phone measured when it took the photo, which gives a photo without a sticker its scale. */
+export interface PhoneReading {
+  distance_mm: number;
+  /** The camera's field of view across the photo's width. */
+  hfov_deg: number;
+  /** Which way the surface around the wound faces (photo axes: x right, y down, z into the scene). With it the
+   * model corrects for the phone's tilt. */
+  normal?: [number, number, number];
+  /** How far that surface is from flat: large on curved skin, where the size is under-estimated. */
+  surface_rms_mm?: number;
+  source?: string;
+}
+
+/** What POST /check returns: the capture checks alone, before any model runs. */
+export interface PhotoCheck {
+  quality: NonNullable<AnalyzeResponse['quality']>;
+  marker_found: boolean;
+  phone_reading: PhoneReading | null;
+}
 
 /**
  * What POST /analyze returns. Only `status` is always there: a retake carries `quality.issues`, no wound found
@@ -66,6 +99,7 @@ export interface AnalyzeResponse {
    * warnings: what made a usable photo less reliable (low_resolution, blurry, dark, glare). */
   quality?: { ok: boolean; usable?: boolean; issues: string[]; warnings?: string[] };
   marker_found?: boolean;
+  phone_reading?: PhoneReading | null;
   flags?: Flag[];
   wound_type?: ClassResult;
   severity?: Record<string, ClassResult>;
@@ -78,11 +112,14 @@ export interface AnalyzeResponse {
   periwound_erythema_frac?: number;
   periwound_maceration_frac?: number;
   periwound_callus_frac?: number;
+  periwound_redness?: Redness | null;
   /** Classes the tissue model saw but is not yet trusted on (cross-validation): for the clinician to check. */
   tissue_untrusted?: string[];
   /** Per-channel gains from the sticker's grey patch; null when no patch was found. */
   white_balance?: [number, number, number] | null;
   measurement?: Measurement | null;
+  /** A photo with both the sticker and a phone reading: how far the phone's area is from the sticker's. */
+  measurement_check?: { sticker_area_cm2: number; phone_area_cm2: number; phone_vs_sticker_pct: number };
   change?: AreaChange;
   outline?: Outline | null;
   report_markdown?: string;
@@ -91,6 +128,30 @@ export interface AnalyzeResponse {
 }
 
 export type PhotoPhase = 'pre' | 'post';
+
+/** A photo's findings as the phone gets them: everything but the outlines, the draft and the answers. */
+export type PhotoFindings = Omit<AnalyzeResponse, 'outline' | 'tissue_outline' | 'report_markdown' | 'follow_up_questions'>;
+
+export const photoFindings = (f: AnalyzeResponse): PhotoFindings => {
+  const { outline: _o, tissue_outline: _t, report_markdown: _r, follow_up_questions: _q, ...rest } = f;
+  return rest;
+};
+
+/** A post photo taken within this many hours of the pre photo is the same visit (same as progress.py). */
+export const SAME_VISIT_HOURS = 12;
+
+/** Were a treatment's two photos taken in one visit? Photos without dates count as one visit. */
+export const sameVisit = (preTakenAt: string | null | undefined, postTakenAt: string | null | undefined): boolean => {
+  const hours = (new Date(postTakenAt ?? '').getTime() - new Date(preTakenAt ?? '').getTime()) / 3_600_000;
+  return Number.isNaN(hours) || Math.abs(hours) < SAME_VISIT_HOURS;
+};
+
+/** What to call a treatment's post photo: taken after cleaning in the same visit, or days later. */
+export const postPhotoLabel = (preTakenAt: string | null | undefined, postTakenAt: string | null | undefined): string => {
+  if (sameVisit(preTakenAt, postTakenAt)) return 'After cleaning';
+  const days = Math.round((new Date(postTakenAt ?? '').getTime() - new Date(preTakenAt ?? '').getTime()) / 86_400_000);
+  return `After treatment, ${days} ${days === 1 ? 'day' : 'days'} later`;
+};
 
 // ---------------------------------------------------------------- treatment report (wound-ai/wound_ai/care.py)
 
@@ -106,6 +167,7 @@ export interface Observation {
   periwound_erythema_frac: number | null;
   periwound_maceration_frac: number | null;
   periwound_callus_frac: number | null;
+  periwound_redness: Redness | null;
   flags: Flag[];
 }
 
@@ -120,6 +182,7 @@ export const observation = (f: AnalyzeResponse, takenAt: string): Observation =>
   periwound_erythema_frac: f.periwound_erythema_frac ?? null,
   periwound_maceration_frac: f.periwound_maceration_frac ?? null,
   periwound_callus_frac: f.periwound_callus_frac ?? null,
+  periwound_redness: f.periwound_redness ?? null,
   flags: f.flags ?? [],
 });
 
@@ -131,6 +194,8 @@ export interface CareAssessment {
   edge_condition?: string | null;
   periwound_condition?: string | null;
   pain_level?: number | null;
+  /** Probed by the clinician: a photo cannot show depth. */
+  depth_cm?: number | null;
 }
 
 export interface TreatmentInput {
@@ -166,7 +231,8 @@ export interface PhotoChange {
 }
 
 export interface Progress {
-  /** What this visit's cleaning or debridement did (PRE → POST of the same visit). */
+  /** What this visit's cleaning or debridement did (PRE → POST of the same visit). Null when the POST photo is
+   * from days later. */
   session: {
     area_before_cm2?: number;
     area_after_cm2?: number;
@@ -175,7 +241,12 @@ export interface Progress {
     nonviable_after_pct?: number;
     nonviable_removed_points?: number;
   } | null;
-  /** Visit to visit, like with like: POST photos if this visit has one, else PRE photos. */
+  /** What the treatment had done by a POST photo taken days after the PRE photo. */
+  response?: (PhotoChange & { trajectory: Trajectory | null; basis: 'area' | 'tissue' | null }) | null;
+  /** The depth the clinician probed at this visit, beside the last one recorded. */
+  depth?: { depth_cm: number; previous_cm?: number } | null;
+  /** Visit to visit, like with like: after-cleaning photos ("post"), else the wound as found ("pre": every PRE
+   * photo and any POST photo taken days after its visit). */
   healing: {
     phase: PhotoPhase;
     n_photos: number;
@@ -214,6 +285,151 @@ export interface TreatmentReportResponse extends Care {
   flags: Flag[];
   report_markdown: string;
   rules_version: string;
+}
+
+// ---------------------------------------------------------------- the wound analysis in words (portal and phone)
+
+export interface Fact {
+  label: string;
+  value: string;
+}
+
+const pct = (p: number) => `${Math.round(p * 100)}%`;
+const words = (id: string) => id.replace(/_/g, ' ');
+
+export const SEVERITY_NAME: Record<string, string> = {
+  pu_stage: 'Pressure injury stage',
+  burn_depth: 'Burn depth',
+  dfu_wagner: 'Wagner grade',
+  dfu_infection: 'Infection/ischaemia',
+};
+
+/** A classification as the report writes it: a confident label, or uncertain with the top estimates. */
+export function classText(result: ClassResult | undefined | null, name: (label: string) => string): string {
+  if (!result) return 'Not assessed yet (model not installed)';
+  if (result.rule) {
+    return `${name(result.label)} (by rule: ${result.rule}${result.model ? `; model estimate: ${classText(result.model, name)}` : ''})`;
+  }
+  if (result.prob === null) return name(result.label);
+  if (isUncertain(result)) {
+    return `Uncertain. Top estimates: ${result.top.map(([label, p]) => `${name(label)} ${pct(p)}`).join(', ')}`;
+  }
+  return `${name(result.label)} (model confidence ${pct(result.prob)})`;
+}
+
+const REDNESS_TEXT: Record<Redness['level'], string> = { none: 'None seen', mild: 'Mild', marked: 'Marked' };
+
+/**
+ * What the model found in one photo, as label and value rows: type, grade, size, depth, tissue, redness. Depth is
+ * the clinician's (a photo cannot show it); pass it when the assessment recorded one.
+ */
+export function woundFacts(f: PhotoFindings, depthCm?: number | null): Fact[] {
+  const m = f.measurement;
+  const tissue = (t: Record<string, number>) => Object.entries(t).map(([k, v]) => `${words(k)} ${v}%`).join(', ');
+  const rows: Fact[] = [
+    { label: 'Wound type', value: classText(f.wound_type, woundTypeName) },
+    ...Object.entries(f.severity ?? {}).map(([head, result]) => ({ label: SEVERITY_NAME[head] ?? words(head), value: classText(result, words) })),
+    {
+      label: 'Size',
+      value: m
+        ? `${m.area_cm2} cm² · ${m.length_cm} × ${m.width_cm} cm · perimeter ${m.perimeter_cm} cm`
+        : f.marker_found === false
+          ? 'Not measured: calibration sticker not found in the photo'
+          : 'Not measured: no wound outline yet (outline model not installed)',
+    },
+    {
+      label: 'Depth',
+      value: depthCm !== null && depthCm !== undefined ? `${depthCm} cm (probed by the clinician)` : 'Not recorded. A photo cannot show depth: probe it and enter it in the assessment.',
+    },
+  ];
+  if (f.tissue_pct) rows.push({ label: 'Tissue', value: tissue(f.tissue_pct) });
+  else if (f.tissue_pct_uncertain) {
+    rows.push({ label: 'Tissue', value: `Uncertain (model confidence ${pct(f.tissue_confidence ?? 0)}): ${tissue(f.tissue_pct_uncertain)}. Assess on examination.` });
+  }
+  if (f.tissue_untrusted?.length) {
+    rows.push({ label: 'Possibly also', value: `${f.tissue_untrusted.map(words).join(', ')} (the tissue model is not yet reliable for these: check on examination)` });
+  }
+  if (f.periwound_erythema_frac !== undefined && f.periwound_erythema_frac !== null) {
+    rows.push({ label: 'Redness around the wound', value: `Red skin on ${pct(f.periwound_erythema_frac)} of the skin beside the wound` });
+  } else if (f.periwound_redness) {
+    rows.push({
+      label: 'Redness around the wound',
+      value: `${REDNESS_TEXT[f.periwound_redness.level]} in the photo's colour. A hint only: redness shows less on darker skin, so check on examination.`,
+    });
+  }
+  return rows;
+}
+
+/** A change between two photos in words, or null when neither size nor tissue could be compared. */
+export const changeText = (c: PhotoChange | null | undefined): string | null => {
+  if (!c) return null;
+  const parts: string[] = [];
+  if (c.percent_area_reduction !== undefined) {
+    parts.push(`${c.area_before_cm2} → ${c.area_after_cm2} cm² (${Math.abs(c.percent_area_reduction)}% ${c.percent_area_reduction >= 0 ? 'smaller' : 'larger'})`);
+    if (c.cm2_per_week !== undefined) parts.push(`${c.cm2_per_week} cm²/week`);
+  }
+  if (c.nonviable_before_pct !== undefined) parts.push(`non-viable tissue ${c.nonviable_before_pct}% → ${c.nonviable_after_pct}%`);
+  if (!parts.length) return null;
+  return `${parts.join(' · ')}${c.days ? ` over ${c.days} days` : ''}`;
+};
+
+export const TRAJECTORY_NAME: Record<Trajectory, string> = { improving: 'Improving', static: 'Static', deteriorating: 'Deteriorating' };
+
+/** baseline: the first analysed photo, which later ones are compared with. not_compared: nothing comparable. */
+export type HealingState = Trajectory | 'baseline' | 'not_compared';
+
+export interface HealingVerdict {
+  state: HealingState;
+  title: string;
+  /** How it was judged, or why it could not be. */
+  detail: string;
+  rows: Fact[];
+}
+
+/** Is the wound healing or getting worse, with the figures behind the answer. Null until the report has run. */
+export function healingVerdict(progress: Progress | null | undefined): HealingVerdict | null {
+  if (!progress) return null;
+  const h = progress.healing;
+  const s = progress.session;
+  const r = progress.response;
+  const session = s
+    ? [
+        s.area_before_cm2 !== undefined ? `${s.area_before_cm2} → ${s.area_after_cm2} cm²${s.area_note ? ` (${s.area_note})` : ''}` : null,
+        s.nonviable_before_pct !== undefined ? `non-viable tissue ${s.nonviable_before_pct}% → ${s.nonviable_after_pct}%` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ') || null
+    : null;
+  const responseText = r ? [r.trajectory ? TRAJECTORY_NAME[r.trajectory] : null, changeText(r)].filter(Boolean).join(': ') || null : null;
+  const candidates: [string, string | null][] = [
+    ['Before → after this treatment', responseText],
+    // With a later post photo, "since last" is that same before → after pair.
+    ['Since last visit', r ? null : changeText(h.since_last)],
+    ['Since first visit', changeText(h.since_first)],
+    [
+      '4-week check',
+      h.four_week
+        ? `${h.four_week.percent_area_reduction}% smaller at day ${h.four_week.days} (target ${h.four_week.target}%): ${h.four_week.on_track ? 'on track' : 'not on track'}`
+        : null,
+    ],
+    ["This visit's cleaning", session],
+    ['Depth', progress.depth ? `${progress.depth.depth_cm} cm${progress.depth.previous_cm !== undefined ? ` (was ${progress.depth.previous_cm} cm)` : ''}` : null],
+    ['PUSH score', progress.push ? `${progress.push.score}/17 (${progress.push.note})` : null],
+  ];
+  const rows = candidates.filter((c): c is [string, string] => c[1] !== null).map(([label, value]) => ({ label, value }));
+  if (h.trajectory) {
+    const noise = h.noise_band ? ` (${h.noise_band.smaller_pct}% smaller to ${h.noise_band.larger_pct}% larger; ${h.noise_band.source})` : '';
+    return {
+      state: h.trajectory,
+      title: TRAJECTORY_NAME[h.trajectory],
+      detail: `By ${h.basis === 'area' ? 'wound area' : 'tissue mix'}, comparing ${h.phase === 'post' ? 'after-cleaning photos' : 'photos of the wound as found'}. Changes within measurement noise${noise} count as static.`,
+      rows,
+    };
+  }
+  if (h.n_photos <= 1) {
+    return { state: 'baseline', title: 'Baseline', detail: 'The first analysed photo of this wound. Later photos are compared with it.', rows };
+  }
+  return { state: 'not_compared', title: 'Not compared', detail: h.reason ?? 'Not enough photos to compare.', rows };
 }
 
 /** What a reviewer decided about each suggestion, stored in the review's corrections. */

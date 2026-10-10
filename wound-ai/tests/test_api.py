@@ -22,7 +22,7 @@ os.environ["CKPT_DIR"] = tempfile.mkdtemp(prefix="wound_ckpt_empty_")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from api.server import app  # noqa: E402
-from wound_ai.pipeline import mask_outline  # noqa: E402
+from wound_ai.pipeline import mask_outline, periwound_redness  # noqa: E402
 
 KEY = "test-key"
 INTAKE = {"diabetes": "no", "cause": "pressure_lying_or_sitting", "body_location": "heel"}
@@ -40,6 +40,23 @@ def jpeg(img: np.ndarray) -> bytes:
     return buf.tobytes()
 
 
+def with_reading(reading: dict | None, subject_distance_m: float | None = None) -> bytes:
+    """The textured photo as the phone app saves it: its distance reading in the EXIF user comment."""
+    import io
+
+    from PIL import Image
+
+    rng = np.random.default_rng(0)
+    exif = Image.Exif()
+    if reading is not None:
+        exif.get_ifd(0x8769)[0x9286] = b"ASCII\0\0\0" + json.dumps({"woundScale": reading}).encode()
+    if subject_distance_m is not None:
+        exif.get_ifd(0x8769)[0x9206] = subject_distance_m
+    out = io.BytesIO()
+    Image.fromarray(rng.integers(40, 210, (480, 640, 3), dtype=np.uint8)).save(out, "JPEG", exif=exif, quality=95)
+    return out.getvalue()
+
+
 def textured_photo() -> bytes:
     """Sharp, evenly lit 640x480 image that passes the quality gate."""
     rng = np.random.default_rng(0)
@@ -54,6 +71,11 @@ def analyze(client: TestClient, photo: bytes, intake: dict | str = INTAKE, key: 
 
 def test_health_is_open(client):
     assert client.get("/health").status_code == 200
+
+
+def test_try_page_is_served_without_the_key(client):
+    r = client.get("/try")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
 
 
 def test_every_other_route_needs_the_key(client):
@@ -99,6 +121,153 @@ def test_blank_photo_asks_for_a_retake(client):
     assert "report_markdown" not in f
 
 
+def test_check_reports_quality_and_the_sticker_without_running_a_model(client):
+    def check(photo: bytes, key: str | None = KEY):
+        return client.post("/check", files={"image": ("w.jpg", photo, "image/jpeg")},
+                           headers={"X-API-Key": key} if key else {})
+
+    assert check(textured_photo(), key=None).status_code == 401
+    plain = check(textured_photo()).json()
+    assert plain["quality"]["usable"] and plain["marker_found"] is False
+    assert set(plain) == {"quality", "marker_found", "phone_reading"} and plain["phone_reading"] is None
+
+    from wound_ai.measure import ARUCO_DICT
+    with_sticker = np.full((480, 640, 3), 255, np.uint8)
+    with_sticker[:, 320:] = np.random.default_rng(1).integers(40, 210, (480, 320, 3), dtype=np.uint8)
+    marker = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICT)), 0, 120)
+    with_sticker[100:220, 100:220] = marker[..., None]
+    assert check(jpeg(with_sticker)).json()["marker_found"] is True
+
+    flat = check(jpeg(np.full((480, 640, 3), 128, np.uint8))).json()
+    assert flat["quality"]["usable"] is False and flat["quality"]["issues"]
+
+
+def test_phone_distance_reading_gives_the_size_when_there_is_no_sticker(client, monkeypatch):
+    from api.server import analyzer
+    mask = np.zeros((480, 640), np.uint8)
+    mask[100:280, 200:440] = 1  # 240 x 180 px
+    monkeypatch.setattr(analyzer, "seg", {"boundary": {"version": "test"}})
+    monkeypatch.setattr(analyzer, "_segment", lambda img, name: mask)
+
+    def send(scale):
+        return client.post("/analyze", files={"image": ("w.jpg", textured_photo(), "image/jpeg")},
+                           data={"intake": json.dumps(INTAKE), "scale": json.dumps(scale)}, headers={"X-API-Key": KEY})
+
+    # 300 mm away with a 90 degree view: the 640 px photo is 600 mm wide, so the wound is 22.5 x 16.9 cm.
+    f = send({"distance_mm": 300, "hfov_deg": 90}).json()
+    assert f["marker_found"] is False
+    m = f["measurement"]
+    assert m["method"] == "phone_distance"
+    assert m["length_cm"] == pytest.approx(22.5, abs=0.15) and m["width_cm"] == pytest.approx(16.9, abs=0.15)
+    assert m["area_cm2"] == pytest.approx(22.5 * 16.875, rel=0.01)
+    assert any("phone's distance reading" in flag["text"] for flag in f["flags"])
+    assert not any("Size not measured" in flag["text"] for flag in f["flags"])
+
+    for bad in ({"distance_mm": 5, "hfov_deg": 70}, {"distance_mm": 300}, {"distance_mm": "300", "hfov_deg": 70}, [300, 70]):
+        assert send(bad).status_code == 400, bad
+    assert analyze(client, textured_photo()).json()["measurement"] is None  # no reading, no sticker: never guessed
+
+    # The phone app writes its reading into the photo, so the photo alone is enough.
+    carried = analyze(client, with_reading({"distance_mm": 300, "hfov_deg": 90, "source": "lidar"})).json()
+    assert carried["phone_reading"]["source"] == "lidar"
+    assert carried["measurement"]["length_cm"] == pytest.approx(22.5, abs=0.15)
+    check = client.post("/check", files={"image": ("w.jpg", with_reading({"distance_mm": 300, "hfov_deg": 90}), "image/jpeg")},
+                        headers={"X-API-Key": KEY}).json()
+    assert check["phone_reading"] == {"distance_mm": 300, "hfov_deg": 90}
+    facing = analyze(client, with_reading({"distance_mm": 300, "hfov_deg": 90, "normal": [0, 0, -1], "surface_rms_mm": 7.5})).json()
+    assert facing["measurement"]["length_cm"] == pytest.approx(22.5, abs=0.15)
+    assert any("tilt was corrected" in flag["text"] for flag in facing["flags"])
+    assert any("curved (about 8 mm from flat)" in flag["text"] for flag in facing["flags"])
+    # A reading that could not be real, or a camera's own subject distance, is ignored.
+    assert analyze(client, with_reading({"distance_mm": 3, "hfov_deg": 90})).json()["measurement"] is None
+    assert analyze(client, with_reading(None, subject_distance_m=0.3)).json()["measurement"] is None
+
+
+def test_phone_reading_of_the_surface_corrects_for_tilt():
+    import math
+
+    from wound_ai.measure import distance_calibration, measure_wound, valid_reading
+
+    w, h, hfov, d, tilt = 1440, 1920, 50.0, 250.0, math.radians(30)
+    focal = w / (2 * math.tan(math.radians(hfov) / 2))
+    # A 40 x 30 mm shape on a surface turned 30 degrees about the photo's vertical axis.
+    corners = [(w / 2 + focal * x * math.cos(tilt) / (d + x * math.sin(tilt)), h / 2 + focal * y / (d + x * math.sin(tilt)))
+               for x, y in ((-20, -15), (20, -15), (20, 15), (-20, 15))]
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [np.round(np.array(corners)).astype(np.int32)], 1)
+    normal = (-math.sin(tilt), 0.0, math.cos(tilt))
+
+    square_on = measure_wound(mask, distance_calibration(d, hfov, (w, h)))
+    corrected = measure_wound(mask, distance_calibration(d, hfov, (w, h), normal))
+    assert square_on.area_cm2 == pytest.approx(12 * math.cos(tilt), rel=0.03)  # foreshortened: 13% too small
+    assert corrected.area_cm2 == pytest.approx(12.0, rel=0.02)
+    assert corrected.length_cm == pytest.approx(4.0, abs=0.05) and corrected.width_cm == pytest.approx(3.0, abs=0.05)
+
+    reading = {"distance_mm": d, "hfov_deg": hfov}
+    assert valid_reading({**reading, "normal": list(normal)})
+    for bad in ([0, 0, 0], [1, 0], "up", [1, 0, 0.1], [float("nan"), 0, 1]):  # no direction, or seen nearly edge-on
+        assert not valid_reading({**reading, "normal": bad}), bad
+
+
+def test_sticker_and_phone_reading_in_one_photo_are_compared(client, monkeypatch):
+    from api.server import analyzer
+    from wound_ai.measure import ARUCO_DICT
+
+    # 6 px per mm: the 640 px photo is 106.7 mm wide, which a 40 degree view sees from 146.5 mm.
+    photo = np.full((480, 640, 3), 255, np.uint8)
+    photo[:, 320:] = np.random.default_rng(1).integers(40, 210, (480, 320, 3), dtype=np.uint8)
+    marker = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, ARUCO_DICT)), 0, 120)
+    photo[100:220, 100:220] = marker[..., None]
+    mask = np.zeros((480, 640), np.uint8)
+    mask[260:440, 360:600] = 1  # 40 x 30 mm
+    monkeypatch.setattr(analyzer, "seg", {"boundary": {"version": "test"}})
+    monkeypatch.setattr(analyzer, "_segment", lambda img, name: mask)
+
+    def send(distance_mm):
+        return client.post("/analyze", files={"image": ("w.png", cv2.imencode(".png", photo)[1].tobytes(), "image/png")},
+                           data={"intake": json.dumps(INTAKE), "scale": json.dumps({"distance_mm": distance_mm, "hfov_deg": 40})},
+                           headers={"X-API-Key": KEY}).json()
+
+    agree = send(146.5)
+    assert agree["measurement"]["method"] == "sticker" and agree["measurement"]["area_cm2"] == pytest.approx(12.0, rel=0.02)
+    assert abs(agree["measurement_check"]["phone_vs_sticker_pct"]) < 2
+    assert not any("than the sticker" in flag["text"] for flag in agree["flags"])
+    off = send(146.5 * 1.1)  # a reading 10% too long makes the area about 21% too large
+    assert off["measurement"]["area_cm2"] == agree["measurement"]["area_cm2"]
+    assert off["measurement_check"]["phone_vs_sticker_pct"] == pytest.approx(21, abs=1.5)
+    assert any("21% larger than the sticker" in flag["text"] for flag in off["flags"])
+
+
+def test_entered_wound_length_gives_the_size_when_nothing_else_does(client, monkeypatch):
+    from api.server import analyzer
+    mask = np.zeros((480, 640), np.uint8)
+    mask[100:281, 200:441] = 1  # 240 x 180 px between its edge pixels' centres
+    mask[20:24, 20:24] = 1      # a speck elsewhere must not change which region the length belongs to
+    monkeypatch.setattr(analyzer, "seg", {"boundary": {"version": "test"}})
+    monkeypatch.setattr(analyzer, "_segment", lambda img, name: mask)
+
+    f = analyze(client, textured_photo(), {**INTAKE, "measured_length_cm": 4.0}).json()
+    m = f["measurement"]
+    assert m["method"] == "entered_length"
+    assert m["length_cm"] == pytest.approx(4.0, abs=0.02) and m["width_cm"] == pytest.approx(3.0, abs=0.02)
+    assert m["area_cm2"] == pytest.approx(12.0, rel=0.02)
+    assert any("scaled from the wound length entered with the photo (4.0 cm)" in flag["text"] for flag in f["flags"])
+    assert "scale from the wound length entered" in f["report_markdown"]
+
+    for bad in (0, 0.05, 500, "4", True):  # not a length a ruler could give: no size rather than a wrong one
+        assert analyze(client, textured_photo(), {**INTAKE, "measured_length_cm": bad}).json()["measurement"] is None, bad
+
+    # With a phone reading too, the reading measures and the ruler length checks it: 22.5 cm against 4 cm is flagged.
+    both = client.post("/analyze", files={"image": ("w.jpg", textured_photo(), "image/jpeg")},
+                       data={"intake": json.dumps({**INTAKE, "measured_length_cm": 4.0}),
+                             "scale": json.dumps({"distance_mm": 300, "hfov_deg": 90})}, headers={"X-API-Key": KEY}).json()
+    assert both["measurement"]["method"] == "phone_distance"
+    assert both["measurement_check"]["entered_length_cm"] == 4.0
+    assert any("longer than the length entered with the photo" in flag["text"] for flag in both["flags"])
+    ids = [q["id"] for q in client.get("/intake/questions", headers={"X-API-Key": KEY}).json()]
+    assert "measured_length_cm" in ids
+
+
 def test_outline_is_scaled_to_the_photo():
     mask = np.zeros((200, 400), np.uint8)
     mask[50:150, 100:300] = 1  # one 200x100 px wound
@@ -109,6 +278,18 @@ def test_outline_is_scaled_to_the_photo():
     ys = [y for _, y in polygons[0]]
     assert min(xs) == pytest.approx(0.25, abs=0.01) and max(xs) == pytest.approx(0.75, abs=0.01)
     assert min(ys) == pytest.approx(0.25, abs=0.01) and max(ys) == pytest.approx(0.75, abs=0.01)
+
+
+def test_redness_is_the_skin_beside_the_wound_against_skin_further_out():
+    skin = np.full((400, 400, 3), (200, 160, 140), np.uint8)  # RGB
+    mask = np.zeros((400, 400), np.uint8)
+    cv2.circle(mask, (200, 200), 50, 1, -1)
+    assert periwound_redness(skin, mask)["level"] == "none"
+    red = skin.copy()
+    cv2.circle(red, (200, 200), 62, (215, 110, 105), -1)  # a red halo just outside the wound
+    r = periwound_redness(red, mask, white_balanced=True)
+    assert r["level"] == "marked" and r["delta_a"] > 8 and r["white_balanced"] is True
+    assert periwound_redness(skin, np.zeros((400, 400), np.uint8)) is None  # no wound, nothing to compare
 
 
 def test_no_outline_without_a_wound():

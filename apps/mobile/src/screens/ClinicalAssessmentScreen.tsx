@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useNavigation, useRoute, type RouteProp } from '@react-navigation/native';
 import type { QuestionAnswer } from '@antigravity-project-spec-pack/domain/questions';
+import { FormField, TextField } from '../components/Form';
 import { FormLayout } from '../components/FormLayout';
 import { QuestionField } from '../components/QuestionField';
 import { Text } from '../components/Typography';
@@ -32,6 +33,9 @@ const PHASE_LABEL = {
   COMPLETED: 'Completed',
 } as const;
 
+/** Depth in cm by probe. A photo cannot show it, so it is the one finding only the clinician can give. */
+const MAX_DEPTH_CM = 30;
+
 const isTrend = (value: QuestionAnswer | undefined): value is Trend => typeof value === 'string' && value in TREND_COLOR;
 
 export const ClinicalAssessmentScreen = () => {
@@ -55,7 +59,12 @@ export const ClinicalAssessmentScreen = () => {
     pain: 0,
     ...answersFrom(treatment?.assessment, treatment?.assessment?.responses),
   }));
+  // Depth is probed afresh at every visit, so a new treatment doesn't start with the last visit's.
+  const [depth, setDepth] = useState(() =>
+    treatment && treatment.phase !== 'PRE' && treatment.assessment?.depthCm !== undefined ? String(treatment.assessment.depthCm) : '',
+  );
   const [submitted, setSubmitted] = useState(false);
+  const depthOffset = useRef<number | undefined>(undefined);
   const scrollRef = useRef<React.ComponentRef<typeof ScrollView>>(null);
   const questionOffsets = useRef<Record<string, number>>({});
 
@@ -76,11 +85,19 @@ export const ClinicalAssessmentScreen = () => {
 
   const setAnswer = (key: string, value: QuestionAnswer | undefined) => setAnswers((prev) => ({ ...prev, [key]: value }));
 
+  const depthCm = Number(depth.replace(',', '.'));
+  const depthGiven = depth.trim() !== '';
+  const depthValid = Number.isFinite(depthCm) && depthCm >= 0 && depthCm <= MAX_DEPTH_CM;
+
   const handleSave = () => {
     setSubmitted(true);
     if (unanswered.length > 0) {
       const offset = questionOffsets.current[unanswered[0].id];
       if (offset !== undefined) scrollRef.current?.scrollTo({ y: Math.max(0, offset - spacing.md), animated: true });
+      return;
+    }
+    if (depthGiven && !depthValid) {
+      if (depthOffset.current !== undefined) scrollRef.current?.scrollTo({ y: Math.max(0, depthOffset.current - spacing.md), animated: true });
       return;
     }
 
@@ -103,6 +120,7 @@ export const ClinicalAssessmentScreen = () => {
         pressureStage: textAnswer(field('pressureStage')),
         burnDepth: textAnswer(field('burnDepth')),
         wagnerGrade: textAnswer(field('wagnerGrade')),
+        ...(depthGiven ? { depthCm } : {}),
         ...(isTrend(trend) ? { woundAppearanceTrend: trend } : {}),
         responses: responsesFrom(asked, answers),
       },
@@ -155,6 +173,29 @@ export const ClinicalAssessmentScreen = () => {
           </View>
         );
       })}
+      <View
+        style={[styles.question, asked.length > 0 && styles.questionDivider]}
+        onLayout={(event) => {
+          depthOffset.current = event.nativeEvent.layout.y;
+        }}
+      >
+        <FormField
+          label="Wound depth (cm)"
+          hint="Probe the deepest point. A photo cannot show depth. Leave empty if not measured."
+          error={submitted && depthGiven && !depthValid ? `Enter the depth in centimetres, between 0 and ${MAX_DEPTH_CM}, or leave it empty.` : undefined}
+          style={{ marginTop: 0 }}
+        >
+          <TextField
+            value={depth}
+            onChangeText={setDepth}
+            keyboardType="decimal-pad"
+            inputMode="decimal"
+            placeholder="e.g. 0.8"
+            accessibilityLabel="Wound depth in centimetres"
+            invalid={submitted && depthGiven && !depthValid}
+          />
+        </FormField>
+      </View>
     </FormLayout>
   );
 };

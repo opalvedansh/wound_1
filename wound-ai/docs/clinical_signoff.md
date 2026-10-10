@@ -77,7 +77,9 @@ Missing contraindications (e.g. malignancy, exposed vessels, untreated osteomyel
 
 ## 4. Healing thresholds
 
-Healing compares **like with like**: after-cleaning photo with after-cleaning photo, or before-treatment with before-treatment if there is no after-cleaning photo. Area is compared only when the calibration sticker is in both photos. Without it, only the tissue mix is compared. A larger area right after debridement is reported as expected, never as worse.
+Healing compares **like with like**: after-cleaning photo with after-cleaning photo, or photos of the wound as found with each other. Area is compared only when the calibration sticker is in both photos. Without it, only the tissue mix is compared. A larger area right after debridement is reported as expected, never as worse.
+
+A treatment's post photo is one of two things, told apart by when it was taken (H11): taken in the same visit, it shows what the cleaning did; taken days later, it shows the wound as the treatment left it, and the change from the pre photo is reported as improving, static or deteriorating.
 
 | # | Threshold | Current value | Decision |
 |---|---|---|---|
@@ -90,6 +92,9 @@ Healing compares **like with like**: after-cleaning photo with after-cleaning ph
 | H7 | **Flag "Wound area has increased"** | Larger than the noise band (H1) since the last comparable photo | ☐ Approve ☐ Change ☐ Remove |
 | H8 | **PUSH score** | Shown for all wounds, labelled "validated for pressure injuries". Exudate from the form: None 0, Scant 1, Moderate 2, Heavy 3 | ☐ Approve ☐ Pressure injuries only ☐ Remove |
 | H10 | **Which tissue types the app may use** | Only classes whose cross-validated test Dice reaches 80% of the clinician-to-clinician Dice on the same photos (LUTSeg gold standard; 0.5 where no clinician figure exists), with at least 15 training and 10 test photos. Others are shown only as "possibly also: …, check on examination" | ☐ Approve ☐ Change ratio to ___ |
+| H11 | **Same visit or later:** a post photo taken within this time of the pre photo is "after cleaning"; later than this it is compared with the pre photo for healing | 12 hours | ☐ Approve ☐ Change to ___ hours |
+| H12 | **Redness around the wound, from the photo's colour:** how much redder the skin beside the wound is than skin further out (CIELAB a*). Shown as a hint with "shows less on darker skin: check on examination"; it raises no flag and feeds no suggestion | Mild from 4, marked from 8 | ☐ Approve ☐ Change to ___ / ___ ☐ Remove |
+| H13 | **Depth** | Entered by the clinician (probe, cm) at each visit; shown beside the last recorded depth. No rule uses it yet | ☐ Approve ☐ Add a rule: ________ |
 | H9 | **Tissue model confidence gate** | Tissue mix below 60% mean model confidence is shown as "uncertain" and not used by any rule | ☐ Approve ☐ Change to ___% |
 
 ## 5. Red flags and severity results (`wound_ai/report.py`, version `flags-0.1-unsigned`)

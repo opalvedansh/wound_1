@@ -17,6 +17,7 @@ import {
   type AnalyzeResponse,
   type IntakeAnswers,
   type IntakeQuestion,
+  type PhotoCheck,
 } from '@antigravity-project-spec-pack/domain/wound-model';
 import type { ReviewView, VisitView } from '@antigravity-project-spec-pack/domain/api';
 import type { ClinicContext } from '../auth/clinic.guard';
@@ -111,6 +112,15 @@ export class VisitsService implements OnModuleInit {
     return this.model.followUps(filterIntake(answers, await this.model.questions()));
   }
 
+  /** Checks a photo the moment it is taken or chosen, so it can be retaken while the patient is there. Nothing is stored. */
+  async photoCheck(photo: PhotoUpload | undefined): Promise<PhotoCheck> {
+    if (!photo) throw new BadRequestException('Add a photo of the wound.');
+    if (photo.size > MAX_PHOTO_BYTES) throw new PayloadTooLargeException('The photo is larger than 15 MB.');
+    const type = imageType(photo.buffer);
+    if (!type) throw new BadRequestException('The photo must be a JPEG or PNG image.');
+    return this.model.check({ buffer: photo.buffer, mimetype: type });
+  }
+
   private async view(ctx: ClinicContext, id: string): Promise<VisitView> {
     const row = await this.prisma.aIResult.findFirst({ where: { id, clinicId: ctx.clinicId }, select: visitSelect });
     if (!row) throw new NotFoundException('Visit not found.');
@@ -183,6 +193,7 @@ export class VisitsService implements OnModuleInit {
     phaseType: 'PRE' | 'POST',
     photo: PhotoUpload | undefined,
     intake: IntakeAnswers,
+    takenAt?: Date,
   ): Promise<{ visitId: string | null }> {
     const t = await this.prisma.treatment.findFirst({
       where: { id: treatmentId, clinicId: ctx.clinicId, deletedAt: null },
@@ -204,7 +215,7 @@ export class VisitsService implements OnModuleInit {
     try {
       visitId = await this.prisma.$transaction(async (tx) => {
         const phaseId = existing?.id ?? (await tx.phase.create({ data: { clinicId: ctx.clinicId, treatmentId: t.id, phaseType }, select: { id: true } })).id;
-        await tx.image.create({ data: { phaseId, imageUrl: path, sha256 } });
+        await tx.image.create({ data: { phaseId, imageUrl: path, sha256, takenAt } });
         if (repeat) return null;
         const result = await tx.aIResult.create({
           data: {
